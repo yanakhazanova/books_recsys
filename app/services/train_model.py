@@ -1,10 +1,10 @@
-# app/services/train_model.py (добавить класс TrainTestSplitter)
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from pathlib import Path
 from typing import Tuple, Dict, Optional, List
+from sklearn.preprocessing import LabelEncoder
 import pandas as pd
 import pickle
 
@@ -115,7 +115,6 @@ class TrainTestSplitter:
         
         return train_df, test_df
     
-# app/services/train_model.py (добавить в существующий файл)
 from app.services.collab_filter import CollaborativeFilter, PopularityFallback, CandidateAnalyzer
 
 class CollaborativeGenerator:
@@ -315,10 +314,49 @@ class AFMTrainer:
         self.train_losses = []
         self.val_losses = []
         
+        # Атрибуты для хранения данных (будут заполнены при fit или load)
+        self.user_encoder = None
+        self.book_encoder = None
+        self.user_scaler = None
+        self.book_scaler = None
+        self.user_cat_cols = []
+        self.book_cat_cols = []
+        self.user_numerical_cols = []
+        self.book_numerical_cols = []
+        self.user_features = None  # Будет установлен при предсказаниях
+        self.book_features = None  # Будет установлен при предсказаниях
+        self.user_clean_to_original = {}
+        self.book_clean_to_original = {}
+        
         print(f"✅ AFMTrainer инициализирован с параметрами:")
         print(f"   embed_dim={embed_dim}, attention_dim={attention_dim}")
         print(f"   batch_size={batch_size}, epochs={epochs}, lr={learning_rate}")
         print(f"   device={self.device}")
+    
+    def _get_categorical_value(self, features_df, col_name, default=0):
+        """
+        Безопасно получает значение категориальной фичи из DataFrame
+        """
+        if col_name not in features_df.index:
+            return default
+        
+        val = features_df[col_name]
+        
+        # Если это Series с несколькими значениями, берем первое
+        if hasattr(val, 'iloc'):
+            if len(val) > 0:
+                val = val.iloc[0]
+            else:
+                return default
+        
+        # Проверяем на NaN
+        if pd.isna(val):
+            return default
+        
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
 
     def prepare_dataloaders(self, triplets_df: pd.DataFrame, 
                            user_features: pd.DataFrame, 
@@ -446,6 +484,10 @@ class AFMTrainer:
         """
         Основной метод для обучения модели
         """
+        # Сохраняем ссылки на данные для предсказаний
+        self.user_features = user_features
+        self.book_features = book_features
+        
         # Подготовка данных
         train_loader, val_loader, dataset = self.prepare_dataloaders(
             triplets_df, user_features, book_features
@@ -458,7 +500,7 @@ class AFMTrainer:
         print(f"\n🚀 Начинаем обучение на {self.epochs} эпох...")
         self.train(train_loader, val_loader)
         
-        # Сохраняем энкодеры и скейлеры в модели для последующего использования
+        # Сохраняем энкодеры и скейлеры из dataset
         self.user_encoder = dataset.user_encoder
         self.book_encoder = dataset.book_encoder
         self.user_scaler = dataset.user_scaler
@@ -467,6 +509,8 @@ class AFMTrainer:
         self.book_cat_cols = dataset.book_cat_cols
         self.user_numerical_cols = dataset.user_numerical_cols
         self.book_numerical_cols = dataset.book_numerical_cols
+        self.user_clean_to_original = getattr(dataset, 'user_clean_to_original', {})
+        self.book_clean_to_original = getattr(dataset, 'book_clean_to_original', {})
         
         return self
     
@@ -485,6 +529,8 @@ class AFMTrainer:
             'book_cat_cols': self.book_cat_cols,
             'user_numerical_cols': self.user_numerical_cols,
             'book_numerical_cols': self.book_numerical_cols,
+            'user_clean_to_original': self.user_clean_to_original,
+            'book_clean_to_original': self.book_clean_to_original,
             'embed_dim': self.embed_dim,
             'attention_dim': self.attention_dim,
             'train_losses': self.train_losses,
@@ -500,7 +546,7 @@ class AFMTrainer:
         if not filepath.exists():
             raise FileNotFoundError(f"Модель не найдена: {filepath}")
         
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         # Восстанавливаем параметры
         self.embed_dim = checkpoint['embed_dim']
@@ -513,8 +559,14 @@ class AFMTrainer:
         self.book_cat_cols = checkpoint['book_cat_cols']
         self.user_numerical_cols = checkpoint['user_numerical_cols']
         self.book_numerical_cols = checkpoint['book_numerical_cols']
+        self.user_clean_to_original = checkpoint.get('user_clean_to_original', {})
+        self.book_clean_to_original = checkpoint.get('book_clean_to_original', {})
         self.train_losses = checkpoint.get('train_losses', [])
         self.val_losses = checkpoint.get('val_losses', [])
+        
+        # Данные для предсказаний должны быть загружены отдельно
+        self.user_features = None
+        self.book_features = None
         
         # Создаем модель с правильными размерами
         user_cat_dims = {col: 2 for col in self.user_cat_cols}
@@ -541,20 +593,17 @@ class AFMTrainer:
     def predict_for_user(self, user_id: int, book_ids: List[str], top_n: int = None) -> List[Tuple[str, float]]:
         """
         Предсказание для одного пользователя и списка книг
-        
-        Args:
-            user_id: ID пользователя
-            book_ids: список ISBN книг для ранжирования
-            top_n: если указан, вернуть только top_n книг
-            
-        Returns:
-            List of (book_id, score) отсортированный по убыванию score
         """
+        if self.model is None:
+            raise ValueError("Модель не загружена. Сначала вызовите fit() или load()")
+        
+        if self.user_features is None or self.book_features is None:
+            raise ValueError("Данные для предсказаний не загружены. Установите user_features и book_features")
+        
         self.model.eval()
         
         # Проверяем, известен ли пользователь
         if user_id not in self.user_encoder.classes_:
-            # Если пользователь новый, возвращаем популярные книги
             print(f"⚠️ Пользователь {user_id} не известен модели")
             return []
         
@@ -572,12 +621,12 @@ class AFMTrainer:
             dtype=torch.float32
         ).to(self.device)
         
-        # Категориальные фичи пользователя
+        # Категориальные фичи пользователя - используем безопасный метод
         user_categorical = []
         for clean_col in self.user_cat_cols:
             orig_col = self.user_clean_to_original.get(clean_col, clean_col)
-            val = user_f[orig_col] if orig_col in user_f.index and pd.notna(user_f[orig_col]) else 0
-            user_categorical.append(int(val))
+            val = self._get_categorical_value(user_f, orig_col)
+            user_categorical.append(val)
         user_categorical = torch.tensor(user_categorical, dtype=torch.long).unsqueeze(0).to(self.device)
         
         scores = []
@@ -601,16 +650,15 @@ class AFMTrainer:
                 dtype=torch.float32
             ).to(self.device)
             
-            # Категориальные фичи книги
+            # Категориальные фичи книги - используем безопасный метод
             book_categorical = []
             for clean_col in self.book_cat_cols:
                 orig_col = self.book_clean_to_original.get(clean_col, clean_col)
-                val = book_f[orig_col] if orig_col in book_f.index and pd.notna(book_f[orig_col]) else 0
-                book_categorical.append(int(val))
+                val = self._get_categorical_value(book_f, orig_col)
+                book_categorical.append(val)
             book_categorical = torch.tensor(book_categorical, dtype=torch.long).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
-                # Создаем batch
                 batch = {
                     'user_id': torch.tensor([user_idx], device=self.device),
                     'pos_id': torch.tensor([book_idx], device=self.device),
@@ -624,14 +672,12 @@ class AFMTrainer:
                     'weight': torch.tensor([1.0], device=self.device)
                 }
                 
-                # Получаем эмбеддинг и предсказание
                 emb = self.model.get_embedding(
                     batch['user_id'], batch['pos_id'],
                     batch['user_numerical'], batch['user_categorical'],
                     batch['pos_numerical'], batch['pos_categorical']
                 )
                 
-                # Attention и предсказание
                 attn = torch.sigmoid(self.model.attention(emb))
                 weighted = emb * attn
                 score = self.model.predict(weighted).squeeze().item()
@@ -651,33 +697,22 @@ class AFMTrainer:
                              top_n: int = 10) -> Dict[int, List[str]]:
         """
         Предсказание для всех пользователей
-        
-        Args:
-            candidates_dict: {user_id: {isbn: score}} - кандидаты от CF
-            top_n: количество рекомендаций на пользователя
-            
-        Returns:
-            {user_id: [isbn1, isbn2, ...]} - отранжированные рекомендации
         """
+        if self.model is None:
+            raise ValueError("Модель не загружена. Сначала вызовите fit() или load()")
+        
         self.model.eval()
         recommendations = {}
         
-        # Получаем маппинг для категориальных колонок
-        user_clean_to_original = getattr(self, 'user_clean_to_original', {})
-        book_clean_to_original = getattr(self, 'book_clean_to_original', {})
-        
         for user_id, candidate_books in tqdm(candidates_dict.items(), desc="Ранжирование"):
             if user_id not in self.user_encoder.classes_:
-                # Неизвестный пользователь - берем топ популярных из кандидатов
                 recommendations[user_id] = list(candidate_books.keys())[:top_n]
                 continue
             
-            # Ранжируем книги для пользователя
             ranked = self.predict_for_user(user_id, list(candidate_books.keys()), top_n=top_n)
             recommendations[user_id] = [book_id for book_id, _ in ranked]
         
         return recommendations
-
 
     
 

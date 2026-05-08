@@ -206,25 +206,36 @@ async def get_training_losses():
 
 # app/api/endpoints.py - исправленные эндпоинты
 
+# app/api/endpoints.py - исправленный эндпоинт train
+
 @router.post("/train", response_model=TrainResponse)
 async def train_model(
-    use_existing_model: bool = Query(False, description="Использовать уже сохраненную модель, если есть"),
-    epochs: int = Query(10, ge=1, le=100, description="Количество эпох обучения"),
-    batch_size: int = Query(512, ge=1, le=10000, description="Размер батча"),
-    embed_dim: int = Query(64, ge=16, le=256, description="Размерность эмбеддингов"),
-    attention_dim: int = Query(32, ge=8, le=128, description="Размерность attention слоя"),
-    learning_rate: float = Query(0.001, ge=0.0001, le=0.1, description="Скорость обучения")
+    use_existing_model: bool = Query(False, description="Использовать уже сохраненную модель"),
+    epochs: int = Query(10, ge=1, le=100),
+    batch_size: int = Query(512, ge=1, le=10000),
+    embed_dim: int = Query(64, ge=16, le=256),
+    attention_dim: int = Query(32, ge=8, le=128),
+    learning_rate: float = Query(0.001, ge=0.0001, le=0.1)
 ):
     """Обучение модели AFM (или загрузка существующей)"""
-    global model, book_features, user_features, triplets
+    global model, book_features, user_features, triplets, candidates, train_ratings, test_ratings
     
     try:
-        # Загружаем фичи и триплеты из кэша
+        # Загружаем все необходимые данные из кэша
         if book_features is None:
             book_features, user_features, triplets = data_cache.load_features()
         
+        if candidates is None:
+            candidates = data_cache.load_candidates()
+        
+        if train_ratings is None:
+            train_ratings, test_ratings = data_cache.load_split()
+        
         if book_features is None or triplets is None:
             raise HTTPException(status_code=400, detail="Нет фичей. Сначала вызовите /features")
+        
+        if candidates is None:
+            raise HTTPException(status_code=400, detail="Нет кандидатов. Сначала вызовите /candidates")
         
         trainer = AFMTrainer(
             embed_dim=embed_dim,
@@ -234,12 +245,18 @@ async def train_model(
             learning_rate=learning_rate
         )
         
-        # Проверяем, есть ли сохраненная модель
         model_path = Path(settings.models_dir) / "afm_model.pth"
         
         if use_existing_model and model_path.exists():
             print(f"📂 Загружаем существующую модель из {model_path}")
             trainer.load(str(model_path))
+            
+            # ВАЖНО: восстанавливаем ссылки на данные для предсказаний
+            trainer.user_features = user_features
+            trainer.book_features = book_features
+            
+            model = trainer
+            print("✅ Модель загружена и готова к использованию")
         else:
             if use_existing_model and not model_path.exists():
                 print(f"⚠️ Модель не найдена в {model_path}, обучаем новую...")
@@ -247,23 +264,26 @@ async def train_model(
             print("🚀 Обучаем новую модель...")
             trainer.fit(triplets, user_features, book_features)
             trainer.save(str(model_path))
-        
-        model = trainer
+            
+            # Сохраняем ссылки на данные
+            trainer.user_features = user_features
+            trainer.book_features = book_features
+            
+            model = trainer
         
         return TrainResponse(
             status="success",
             model_path=str(model_path),
-            cv_score=trainer.val_losses[-1] if trainer.val_losses else None
+            cv_score=model.val_losses[-1] if model.val_losses else None
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Ошибка при обучении модели: {str(e)}")
+        print(f"❌ Ошибка: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка при обучении модели: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @router.post("/train_full", response_model=TrainResponse)
 async def train_full_pipeline(
@@ -338,9 +358,27 @@ async def train_full_pipeline(
         raise HTTPException(status_code=500, detail=f"Ошибка в полном пайплайне: {str(e)}")
     
 
+# app/api/endpoints.py - исправленный эндпоинт status
+
+def convert_to_serializable(obj):
+    """Рекурсивно конвертирует numpy типы в Python типы"""
+    if isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
+
 @router.get("/status", response_model=dict)
 async def get_training_status():
     """Проверка статуса подготовки данных и обучения"""
+    global train_ratings, test_ratings, candidates, book_features, user_features, triplets, model, books_df
     
     # Проверяем наличие сохраненной модели AFM
     model_file_exists = (settings.model_path).exists()
@@ -351,61 +389,63 @@ async def get_training_status():
     # Получаем информацию о модели, если она загружена
     model_info = {}
     if model_in_memory and hasattr(model, 'model'):
-        # Если модель обучена, получаем дополнительную информацию
         model_info = {
             "embed_dim": getattr(model, 'embed_dim', None),
             "attention_dim": getattr(model, 'attention_dim', None),
             "is_trained": len(getattr(model, 'train_losses', [])) > 0,
             "epochs_completed": len(getattr(model, 'train_losses', [])),
-            "final_train_loss": model.train_losses[-1] if model.train_losses else None,
-            "final_val_loss": model.val_losses[-1] if model.val_losses else None
+            "final_train_loss": float(model.train_losses[-1]) if model.train_losses else None,
+            "final_val_loss": float(model.val_losses[-1]) if model.val_losses else None
         }
     
-    # Получаем статистику по фичам, если они загружены
+    # Получаем статистику по фичам
     features_info = {}
     if book_features is not None:
         features_info = {
             "book_features_shape": list(book_features.shape),
             "user_features_shape": list(user_features.shape) if user_features is not None else None,
-            "triplets_count": len(triplets) if triplets is not None else 0
+            "triplets_count": int(len(triplets)) if triplets is not None else 0
         }
     
-    # Проверяем, есть ли кандидаты и их статистика
+    # Статистика по кандидатам
     candidates_info = {}
     if candidates is not None:
         candidates_counts = [len(recs) for recs in candidates.values()]
         candidates_info = {
             "total_users": len(candidates),
-            "avg_candidates": np.mean(candidates_counts) if candidates_counts else 0,
-            "min_candidates": np.min(candidates_counts) if candidates_counts else 0,
-            "max_candidates": np.max(candidates_counts) if candidates_counts else 0
+            "avg_candidates": float(np.mean(candidates_counts)) if candidates_counts else 0,
+            "min_candidates": int(np.min(candidates_counts)) if candidates_counts else 0,
+            "max_candidates": int(np.max(candidates_counts)) if candidates_counts else 0
         }
     
+    # Получаем количество пользователей
+    train_users_count = 0
+    test_users_count = 0
+    train_interactions = 0
+    test_interactions = 0
+    
+    if train_ratings is not None:
+        train_users_count = int(train_ratings['User-ID'].nunique())
+        train_interactions = len(train_ratings)
+    
+    if test_ratings is not None:
+        test_users_count = int(test_ratings['User-ID'].nunique())
+        test_interactions = len(test_ratings)
+    
     status = {
-        # Статус наличия файлов
         "data_ready": data_cache.check_cleaned_data(),
         "split_ready": data_cache.check_split(),
         "candidates_ready": data_cache.check_candidates(),
         "features_ready": data_cache.check_features(),
         "model_file_exists": model_file_exists,
         "model_loaded_in_memory": model_in_memory,
-        
-        # Статистика по данным в памяти
-        "train_users": int(train_ratings['User-ID'].nunique()) if train_ratings is not None else 0,
-        "test_users": int(test_ratings['User-ID'].nunique()) if test_ratings is not None else 0,
-        "total_interactions_train": len(train_ratings) if train_ratings is not None else 0,
-        "total_interactions_test": len(test_ratings) if test_ratings is not None else 0,
-        
-        # Статистика по кандидатам
+        "train_users": train_users_count,
+        "test_users": test_users_count,
+        "total_interactions_train": train_interactions,
+        "total_interactions_test": test_interactions,
         "candidates": candidates_info,
-        
-        # Статистика по фичам
         "features": features_info,
-        
-        # Информация о модели
         "model": model_info,
-        
-        # Рекомендация по следующим шагам
         "next_steps": _get_next_steps(
             data_cache.check_cleaned_data(),
             data_cache.check_split(),
@@ -416,12 +456,13 @@ async def get_training_status():
         )
     }
     
+    # Конвертируем все numpy типы в стандартные Python типы
+    status = convert_to_serializable(status)
+    
     return status
-
 
 def _get_next_steps(data_ready, split_ready, candidates_ready, features_ready, model_file_exists, model_in_memory):
     """Определяет, какой эндпоинт вызывать следующим"""
-    
     if not data_ready:
         return "Вызовите POST /api/v1/prepare для загрузки и очистки данных"
     
@@ -441,7 +482,6 @@ def _get_next_steps(data_ready, split_ready, candidates_ready, features_ready, m
             return "Вызовите POST /api/v1/train?use_existing_model=false для обучения новой модели"
     
     return "Все готово! Используйте GET /api/v1/metrics и GET /api/v1/recommend/{user_id}"
-
 
 @router.delete("/cache")
 async def clear_cache():
@@ -465,23 +505,31 @@ async def clear_cache():
 # app/api/endpoints.py - добавить/обновить эндпоинты
 
 @router.get("/metrics", response_model=MetricsResponse)
-async def get_metrics(
-    k: int = Query(10, ge=1, le=50, description="Количество рекомендаций для оценки")
-):
+async def get_metrics(k: int = Query(10, ge=1, le=50)):
     """Расчет метрик на тестовых пользователях"""
-    global model, candidates, test_ratings
+    global model, candidates, test_ratings, book_features, user_features
     
+    # Проверяем наличие всех необходимых данных
     if model is None:
-        raise HTTPException(status_code=400, detail="Модель еще не обучена. Сначала вызовите /train")
+        raise HTTPException(status_code=400, detail="Модель не загружена. Сначала вызовите /train")
     
     if candidates is None:
-        raise HTTPException(status_code=400, detail="Нет кандидатов. Сначала вызовите /candidates")
+        candidates = data_cache.load_candidates()
+        if candidates is None:
+            raise HTTPException(status_code=400, detail="Нет кандидатов. Сначала вызовите /candidates")
     
     if test_ratings is None:
-        raise HTTPException(status_code=400, detail="Нет тестовых данных. Сначала вызовите /split")
+        _, test_ratings = data_cache.load_split()
+        if test_ratings is None:
+            raise HTTPException(status_code=400, detail="Нет тестовых данных. Сначала вызовите /split")
+    
+    # Убеждаемся, что у модели есть ссылки на данные
+    if model.user_features is None:
+        model.user_features = user_features
+    if model.book_features is None:
+        model.book_features = book_features
     
     try:
-        # Генерируем рекомендации для всех пользователей
         print(f"\n🎯 Генерация рекомендаций для расчета метрик @{k}...")
         recommendations = model.predict_for_all_users(candidates, top_n=k)
         
@@ -489,20 +537,19 @@ async def get_metrics(
         metrics = MetricsCalculator.calculate_all_metrics(recommendations, test_ratings, k)
         
         return MetricsResponse(
-            ndcg_at_k=metrics['ndcg_at_k'],
-            precision_at_k=metrics['precision_at_k'],
-            recall_at_k=metrics['recall_at_k'],
+            ndcg_at_k=float(metrics['ndcg_at_k']),
+            precision_at_k=float(metrics['precision_at_k']),
+            recall_at_k=float(metrics['recall_at_k']),
             k=k,
-            hit_rate_at_k=metrics['hit_rate'],
-            users_with_hits_ratio=metrics['users_with_hits_ratio']
+            hit_rate_at_k=float(metrics.get('hit_rate', 0)),
+            users_with_hits_ratio=float(metrics.get('users_with_hits_ratio', 0))
         )
         
     except Exception as e:
         print(f"❌ Ошибка при расчете метрик: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка при расчете метрик: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @router.get("/recommend/{user_id}", response_model=UserRecsResponse)
 async def recommend_for_user(
