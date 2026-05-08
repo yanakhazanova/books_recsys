@@ -3,6 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import router
 from app.services.train_model import AFMTrainer, DataCache
 from app.core.config import settings
+from app.state import (
+    model, candidates, train_ratings, test_ratings,
+    book_features, user_features, triplets, books_df, books_titles_dict, data_cache
+)
+import app.state as state
 
 app = FastAPI(
     title="Book Recommendation System",
@@ -21,6 +26,60 @@ app.add_middleware(
 
 app.include_router(router)
 
+@app.on_event("startup")
+async def startup_event():
+    """При старте сервера загружаем модель и данные из кэша"""
+    from app.services.train_model import AFMTrainer
+    
+    print("\n" + "="*60)
+    print("🚀 ЗАПУСК FASTAPI ПРИЛОЖЕНИЯ")
+    print("="*60)
+    
+    # 1. Загружаем очищенные данные для получения books_df
+    ratings, books, users = data_cache.load_cleaned_data()
+    if books is not None:
+        state.books_df = books
+        if 'ISBN' in books.columns and 'Title' in books.columns:
+            state.books_titles_dict = dict(zip(
+                books['ISBN'].astype(str), 
+                books['Title']
+            ))
+            print(f"✅ Загружены данные о книгах: {len(state.books_df)} записей, {len(state.books_titles_dict)} названий")
+    
+    # 2. Загружаем сплиты
+    train_r, test_r = data_cache.load_split()
+    if train_r is not None:
+        state.train_ratings = train_r
+        state.test_ratings = test_r
+        print(f"✅ Загружены сплиты: train={len(state.train_ratings)}, test={len(state.test_ratings)}")
+    
+    # 3. Загружаем кандидатов
+    state.candidates = data_cache.load_candidates()
+    if state.candidates is not None:
+        print(f"✅ Загружены кандидаты для {len(state.candidates)} пользователей")
+    
+    # 4. Загружаем фичи и триплеты
+    bf, uf, trips = data_cache.load_features()
+    if bf is not None:
+        state.book_features = bf
+        state.user_features = uf
+        state.triplets = trips
+        print(f"✅ Загружены фичи: books={state.book_features.shape}, users={state.user_features.shape}")
+    
+    # 5. Загружаем модель
+    if settings.model_path.exists():
+        try:
+            trainer = AFMTrainer()
+            trainer.load(str(settings.model_path))
+            trainer.user_features = state.user_features
+            trainer.book_features = state.book_features
+            state.model = trainer
+            print("✅ Модель успешно загружена")
+        except Exception as e:
+            print(f"⚠️ Не удалось загрузить модель: {e}")
+    
+    print("="*60 + "\n")
+
 @app.get("/")
 async def root():
     return {
@@ -33,62 +92,6 @@ async def root():
             "GET /api/v1/recommend/{user_id}?n_recs=10 - рекомендации для пользователя"
         ]
     }
-
-
-@app.on_event("startup")
-async def startup_event():
-    """При старте сервера загружаем модель и данные из кэша"""
-    global model, candidates, train_ratings, test_ratings, book_features, user_features, triplets, books_df
-    
-    print("\n" + "="*60)
-    print("🚀 ЗАПУСК FASTAPI ПРИЛОЖЕНИЯ")
-    print("="*60)
-    
-    # 1. Загружаем очищенные данные для получения books_df
-    cache = DataCache()
-    ratings, books, users = cache.load_cleaned_data()
-    if books is not None:
-        books_df = books
-        print(f"✅ Загружены данные о книгах: {len(books_df)} записей")
-    
-    # 2. Загружаем сплиты
-    train_ratings, test_ratings = cache.load_split()
-    if train_ratings is not None:
-        print(f"✅ Загружены сплиты: train={len(train_ratings)}, test={len(test_ratings)}")
-    
-    # 3. Загружаем кандидатов
-    candidates = cache.load_candidates()
-    if candidates is not None:
-        print(f"✅ Загружены кандидаты для {len(candidates)} пользователей")
-    
-    # 4. Загружаем фичи и триплеты
-    book_features, user_features, triplets = cache.load_features()
-    if book_features is not None:
-        print(f"✅ Загружены фичи: books={book_features.shape}, users={user_features.shape}, triplets={len(triplets)}")
-    
-    # 5. Загружаем модель
-    model_path = settings.model_path
-    if model_path.exists():
-        try:
-            print(f"📂 Загружаем модель из {model_path}")
-            trainer = AFMTrainer()
-            trainer.load(str(model_path))
-            
-            # Восстанавливаем ссылки на данные для предсказаний
-            trainer.user_features = user_features
-            trainer.book_features = book_features
-            trainer.user_clean_to_original = getattr(trainer, 'user_clean_to_original', {})
-            trainer.book_clean_to_original = getattr(trainer, 'book_clean_to_original', {})
-            
-            model = trainer
-            print("✅ Модель успешно загружена в память")
-        except Exception as e:
-            print(f"⚠️ Не удалось загрузить модель: {e}")
-    else:
-        print("ℹ️ Сохраненная модель не найдена")
-    
-    print("="*60 + "\n")
-
 
 if __name__ == "__main__":
     import uvicorn

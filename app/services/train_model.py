@@ -693,18 +693,39 @@ class AFMTrainer:
         
         return results
     
+
     def predict_for_all_users(self, candidates_dict: Dict[int, Dict[str, float]], 
-                             top_n: int = 10) -> Dict[int, List[str]]:
+                            top_n: int = 10,
+                            sample_users: int = None) -> Dict[int, List[str]]:
         """
         Предсказание для всех пользователей
+        
+        Args:
+            candidates_dict: {user_id: {isbn: score}} - кандидаты от CF
+            top_n: количество рекомендаций на пользователя
+            sample_users: если указан, предсказать только для N случайных пользователей
         """
         if self.model is None:
-            raise ValueError("Модель не загружена. Сначала вызовите fit() или load()")
+            raise ValueError("Модель не загружена")
         
         self.model.eval()
+        
+        # Ограничиваем выборку если нужно
+        if sample_users and sample_users < len(candidates_dict):
+            import random
+            user_ids = list(candidates_dict.keys())
+            sampled_user_ids = random.sample(user_ids, sample_users)
+            filtered_candidates = {user: candidates_dict[user] for user in sampled_user_ids}
+            print(f"📊 Предсказания для выборки {len(filtered_candidates)} пользователей (из {len(candidates_dict)})")
+        else:
+            filtered_candidates = candidates_dict
+            print(f"📊 Предсказания для всех {len(filtered_candidates)} пользователей")
+        
         recommendations = {}
         
-        for user_id, candidate_books in tqdm(candidates_dict.items(), desc="Ранжирование"):
+        # Используем tqdm для прогресс-бара
+        from tqdm import tqdm
+        for user_id, candidate_books in tqdm(filtered_candidates.items(), desc="Ранжирование"):
             if user_id not in self.user_encoder.classes_:
                 recommendations[user_id] = list(candidate_books.keys())[:top_n]
                 continue

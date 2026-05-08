@@ -25,6 +25,8 @@ class MetricsResponse(BaseModel):
     k: int
     hit_rate_at_k: Optional[float] = None
     users_with_hits_ratio: Optional[float] = None
+    sample_size: Optional[int] = None
+    total_users: Optional[int] = None
 
 class UserRecommendation(BaseModel):
     book_id: int
