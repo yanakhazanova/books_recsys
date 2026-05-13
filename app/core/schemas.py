@@ -12,6 +12,7 @@ class TrainResponse(BaseModel):
     status: str
     model_path: str
     cv_score: Optional[float] = None
+    message: Optional[str] = None  # Добавлено поле для сообщения
 
 class GlobalShapResponse(BaseModel):
     feature_importance: Dict[str, float]  # feature_name -> mean(|SHAP|)
@@ -33,6 +34,7 @@ class UserRecommendation(BaseModel):
     book_title: Optional[str] = None
     score: float
     rank: Optional[int] = None
+    shap_explanation: Optional[Dict[str, Any]] = None
 
 class UserRecsResponse(BaseModel):
     user_id: int

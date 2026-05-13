@@ -1,4 +1,3 @@
-# app/api/endpoints.py
 from fastapi import APIRouter, HTTPException, Query
 from app.core.schemas import (
     PrepareDataResponse, TrainResponse, MetricsResponse,
@@ -13,6 +12,13 @@ from app.services.metrics_calculation import MetricsCalculator
 from app.core.config import settings
 from app.state import data_cache
 import app.state as state
+
+from app.services.shap_analyzer import SHAPAnalyzer
+import random
+
+from typing import Optional
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["recommendations"])
 
@@ -53,7 +59,6 @@ async def split_train_test(
     test_items_per_user: int = Query(2, description="Сколько книг на пользователя в тесте")
 ):
     """Только разделение данных на train/test"""
-    global train_ratings, test_ratings
     
     try:
         # Загружаем очищенные данные из кэша
@@ -89,7 +94,6 @@ async def generate_candidates(
     n_candidates: int = Query(1000, description="Количество кандидатов на пользователя")
 ):
     """Генерация кандидатов коллаборативной фильтрацией"""
-    global train_ratings, test_ratings, candidates
     
     try:
         # Загружаем сплиты из кэша
@@ -118,7 +122,6 @@ async def generate_candidates(
 @router.post("/features", response_model=TrainResponse)
 async def create_features():
     """Формирование фичей и триплетов"""
-    global train_ratings, candidates, book_features, user_features, triplets
     
     try:
         # Загружаем необходимые данные
@@ -212,6 +215,52 @@ async def train_model(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/train/continue", response_model=TrainResponse)
+async def continue_training(
+    additional_epochs: int = Query(5, ge=1, le=50, description="Дополнительных эпох"),
+    learning_rate: Optional[float] = Query(None, ge=0.0001, le=0.01, description="Новая learning rate (опционально)"),
+    reset_optimizer: bool = Query(False, description="Сбросить оптимизатор")
+):
+    """
+    Продолжает обучение существующей модели (дообучение)
+    """
+    if state.model is None:
+        raise HTTPException(status_code=400, detail="Модель не загружена. Сначала вызовите /train")
+    
+    try:
+        # Загружаем фичи и триплеты
+        if state.book_features is None:
+            state.book_features, state.user_features, state.triplets = data_cache.load_features()
+        
+        if state.book_features is None or state.triplets is None:
+            raise HTTPException(status_code=400, detail="Нет фичей. Сначала вызовите /features")
+        
+        # Продолжаем обучение
+        state.model.continue_training(
+            triplets_df=state.triplets,
+            user_features=state.user_features,
+            book_features=state.book_features,
+            additional_epochs=additional_epochs,
+            learning_rate=learning_rate,
+            reset_optimizer=reset_optimizer
+        )
+        
+        # Сохраняем обновленную модель
+        state.model.save(str(settings.model_path))
+        
+        return TrainResponse(
+            status="success",
+            model_path=str(settings.model_path),
+            cv_score=state.model.val_losses[-1] if state.model.val_losses else None,
+            message=f"Добавлено {additional_epochs} эпох. Всего: {len(state.model.train_losses)}"
+        )
+        
+    except Exception as e:
+        print(f"❌ Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @router.post("/train_full", response_model=TrainResponse)
 async def train_full_pipeline(
     test_items_per_user: int = Query(2, description="Сколько книг на пользователя в тесте"),
@@ -435,3 +484,310 @@ def _get_next_steps(data_ready, split_ready, candidates_ready, features_ready, m
            f"   - GET /api/v1/recommend/{{user_id}}?n_recs=10 для получения рекомендаций\n" \
            f"   - GET /api/v1/metrics?k=10&sample_users=100 для оценки качества\n" \
            f"   - POST /api/v1/shap/initialize для SHAP интерпретации"
+
+
+@router.post("/shap/initialize")
+async def initialize_shap(
+    n_background: int = Query(100, ge=10, le=500, description="Количество фоновых пар для SHAP"),
+    n_test: int = Query(50, ge=10, le=200, description="Количество тестовых пар для глобального анализа")
+):
+    """
+    Инициализирует SHAP объяснитель для глобальной интерпретации
+    """    
+    if state.model is None:
+        raise HTTPException(status_code=400, detail="Модель не загружена. Сначала вызовите /train")
+    
+    if state.candidates is None:
+        raise HTTPException(status_code=400, detail="Нет кандидатов. Сначала вызовите /candidates")
+    
+    try:
+        # Собираем пары (user, book) из кандидатов
+        all_pairs = []
+        users = list(state.candidates.keys())
+        
+        # Для фона берем случайных пользователей и их кандидатов
+        background_users = random.sample(users, min(n_background // 5, len(users)))
+        for user_id in background_users:
+            books = list(state.candidates[user_id].keys())[:5]  # по 5 книг на пользователя
+            for book_id in books:
+                all_pairs.append((user_id, book_id))
+        
+        # Создаем SHAP анализатор
+        state.shap_analyzer = SHAPAnalyzer(
+            model=state.model.model,
+            trainer=state.model,
+            device=state.model.device
+        )
+        
+        # Инициализируем
+        result = state.shap_analyzer.initialize(all_pairs[:n_background], n_samples=50)
+        
+        if result['status'] == 'error':
+            raise HTTPException(status_code=400, detail=result['message'])
+        
+        return result
+        
+    except Exception as e:
+        print(f"Ошибка инициализации SHAP: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shap/global")
+async def get_global_shap(
+    n_pairs: int = Query(50, ge=10, le=200, description="Количество пар для глобального анализа"),
+    nsamples_per_pair: int = Query(30, ge=10, le=100, description="Сэмплов SHAP на пару"),
+    top_k: int = Query(20, ge=5, le=50, description="Количество топ-признаков для вывода")
+):
+    """
+    Глобальная интерпретация признаков (на небольшом количестве примеров)
+    """
+    
+    if state.shap_analyzer is None:
+        raise HTTPException(status_code=400, detail="SHAP не инициализирован. Сначала вызовите POST /shap/initialize")
+    
+    if state.candidates is None:
+        raise HTTPException(status_code=400, detail="Нет кандидатов")
+    
+    try:
+        # Собираем случайные пары для анализа
+        all_users = list(state.candidates.keys())
+        test_pairs = []
+        
+        # Случайные пользователи и их книги
+        sample_users = random.sample(all_users, min(n_pairs // 5, len(all_users)))
+        for user_id in sample_users:
+            books = list(state.candidates[user_id].keys())[:5]
+            for book_id in books:
+                test_pairs.append((user_id, book_id))
+        
+        # Вычисляем глобальную важность
+        importance_df = state.shap_analyzer.get_global_importance(
+            test_pairs=test_pairs,
+            nsamples_per_pair=nsamples_per_pair,
+            max_pairs=n_pairs
+        )
+        
+        if importance_df.empty:
+            return {
+                'status': 'error',
+                'message': 'Не удалось вычислить SHAP значения'
+            }
+        
+        # Получаем описания признаков
+        descriptions = state.shap_analyzer.get_feature_descriptions()
+        
+        # Формируем ответ
+        top_features = importance_df.head(top_k)
+        
+        return {
+            'status': 'success',
+            'n_pairs_analyzed': len(test_pairs),
+            'n_features_total': len(importance_df),
+            'feature_importance': [
+                {
+                    'feature': row['feature'],
+                    'description': descriptions.get(row['feature'], row['feature']),
+                    'mean_abs_shap': float(row['mean_abs_shap']),
+                    'mean_shap': float(row['mean_shap']),
+                    'std_shap': float(row['std_shap'])
+                }
+                for _, row in top_features.iterrows()
+            ],
+            'all_features_summary': importance_df.to_dict(orient='records')
+        }
+        
+    except Exception as e:
+        print(f"Ошибка глобального SHAP: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shap/explain/{user_id}/{book_id}")
+async def explain_recommendation(
+    user_id: int,
+    book_id: str,
+    nsamples: int = Query(100, ge=20, le=200, description="Количество сэмплов SHAP")
+):
+    """
+    Объяснение рекомендации для конкретной пары (пользователь, книга)
+    """    
+    if state.shap_analyzer is None:
+        raise HTTPException(status_code=400, detail="SHAP не инициализирован. Сначала вызовите POST /shap/initialize")
+    
+    try:
+        # 🔧 ИСПРАВЛЕНО: Преобразуем book_id из индекса в ISBN если нужно
+        actual_book_id = book_id
+        
+        # Проверяем, является ли book_id числовым индексом
+        if book_id.isdigit() and hasattr(state.model, 'book_encoder'):
+            # Пробуем восстановить ISBN по индексу
+            book_idx = int(book_id)
+            # Ищем книгу с таким индексом в book_encoder
+            if hasattr(state.model, 'book_encoder') and hasattr(state.model.book_encoder, 'classes_'):
+                if book_idx < len(state.model.book_encoder.classes_):
+                    actual_book_id = state.model.book_encoder.classes_[book_idx]
+                    print(f"🔍 Преобразован индекс {book_id} → ISBN {actual_book_id}")
+        
+        # Также проверяем, есть ли книга в book_features по индексу
+        if hasattr(state.model, 'book_features') and state.model.book_features is not None:
+            # Если book_id - это индекс и есть в индексах
+            if book_id.isdigit() and int(book_id) in state.model.book_features.index:
+                # Получаем ISBN из колонки если есть
+                if 'ISBN' in state.model.book_features.columns:
+                    actual_book_id = str(state.model.book_features.loc[int(book_id), 'ISBN'])
+                    print(f"🔍 Найден ISBN {actual_book_id} для индекса {book_id}")
+        
+        # Получаем объяснение
+        explanation = state.shap_analyzer.explain_prediction(user_id, actual_book_id, nsamples=nsamples)
+        
+        # 🔧 ИСПРАВЛЕНО: Проверяем, есть ли ошибка в объяснении
+        if explanation is None:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Не найдены данные для пользователя {user_id} или книги {book_id}"
+            )
+        
+        if 'error' in explanation:
+            raise HTTPException(
+                status_code=400,
+                detail=explanation['error']
+            )
+        
+        # Получаем название книги
+        book_title = None
+        if state.books_titles_dict:
+            book_title = state.books_titles_dict.get(str(actual_book_id))
+        
+        # Если не нашли по ISBN, пробуем найти по индексу
+        if not book_title and hasattr(state.model, 'book_features') and state.model.book_features is not None:
+            if 'Title' in state.model.book_features.columns:
+                if book_id.isdigit() and int(book_id) in state.model.book_features.index:
+                    book_title = state.model.book_features.loc[int(book_id), 'Title']
+        
+        # Получаем описания признаков
+        descriptions = state.shap_analyzer.get_feature_descriptions()
+        
+        return {
+            'status': 'success',
+            'user_id': user_id,
+            'book_id': actual_book_id,
+            'original_book_id': book_id,  # Добавляем исходный ID для отладки
+            'book_title': book_title,
+            'predicted_score': explanation.get('predicted_score', 0),
+            'shap_interpretation': {
+                'top_positive_factors': [
+                    {
+                        'feature': feat,
+                        'description': descriptions.get(feat, feat),
+                        'shap_value': val
+                    }
+                    for feat, val in explanation.get('top_positive', [])[:5]
+                ],
+                'top_negative_factors': [
+                    {
+                        'feature': feat,
+                        'description': descriptions.get(feat, feat),
+                        'shap_value': val
+                    }
+                    for feat, val in explanation.get('top_negative', [])[:5]
+                ]
+            },
+            'all_shap_values': explanation.get('shap_values', {})
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка объяснения: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/shap/explain/recommendations/{user_id}")
+async def explain_user_recommendations(
+    user_id: int,
+    n_recs: int = Query(5, ge=1, le=10, description="Количество рекомендаций для объяснения"),
+    nsamples: int = Query(50, ge=20, le=150, description="Сэмплов SHAP на рекомендацию")
+):
+    """
+    Объяснение всех рекомендаций для пользователя
+    """
+    
+    if state.shap_analyzer is None:
+        raise HTTPException(status_code=400, detail="SHAP не инициализирован. Сначала вызовите POST /shap/initialize")
+    
+    if state.model is None:
+        raise HTTPException(status_code=400, detail="Модель не загружена")
+    
+    try:
+        # Получаем рекомендации для пользователя
+        if user_id not in state.candidates:
+            raise HTTPException(status_code=404, detail=f"Пользователь {user_id} не найден")
+        
+        candidate_books = list(state.candidates[user_id].keys())
+        ranked = state.model.predict_for_user(user_id, candidate_books, top_n=n_recs)
+        
+        recommendations = []
+        for book_id, score in ranked:
+            # 🔧 ИСПРАВЛЕНО: Преобразуем book_id в ISBN если нужно
+            actual_book_id = book_id
+            
+            # Пробуем найти ISBN
+            if hasattr(state.model, 'book_features') and state.model.book_features is not None:
+                # Если book_id - это строка, возможно уже ISBN
+                # Проверяем, есть ли в индексе
+                if book_id in state.model.book_features.index:
+                    if 'ISBN' in state.model.book_features.columns:
+                        actual_book_id = str(state.model.book_features.loc[book_id, 'ISBN'])
+            
+            # Получаем SHAP объяснение
+            explanation = state.shap_analyzer.explain_prediction(user_id, actual_book_id, nsamples=nsamples)
+            
+            if explanation and 'error' not in explanation:
+                book_title = None
+                if state.books_titles_dict:
+                    book_title = state.books_titles_dict.get(str(actual_book_id))
+                
+                recommendations.append({
+                    'book_id': actual_book_id,
+                    'original_book_id': book_id,  # Для отладки
+                    'book_title': book_title,
+                    'score': score,
+                    'top_positive_factors': [
+                        {'feature': feat, 'value': val} 
+                        for feat, val in explanation.get('top_positive', [])[:3]
+                    ],
+                    'top_negative_factors': [
+                        {'feature': feat, 'value': val} 
+                        for feat, val in explanation.get('top_negative', [])[:3]
+                    ]
+                })
+            else:
+                # Если SHAP не сработал, добавляем без объяснения
+                recommendations.append({
+                    'book_id': book_id,
+                    'book_title': state.books_titles_dict.get(str(book_id)) if state.books_titles_dict else None,
+                    'score': score,
+                    'top_positive_factors': [],
+                    'top_negative_factors': [],
+                    'shap_error': explanation.get('error') if explanation else 'Unknown error'
+                })
+        
+        return {
+            'status': 'success',
+            'user_id': user_id,
+            'n_recommendations': len(recommendations),
+            'recommendations': recommendations
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    

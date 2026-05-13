@@ -21,3 +21,4 @@ user_features = None
 triplets = None
 books_df = None
 books_titles_dict = None
+shap_analyzer = None

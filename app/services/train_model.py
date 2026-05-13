@@ -359,19 +359,19 @@ class AFMTrainer:
             return default
 
     def prepare_dataloaders(self, triplets_df: pd.DataFrame, 
-                           user_features: pd.DataFrame, 
-                           book_features: pd.DataFrame) -> Tuple[DataLoader, DataLoader, AFMDataset]:
+                        user_features: pd.DataFrame, 
+                        book_features: pd.DataFrame) -> Tuple[DataLoader, DataLoader, AFMDataset]:
         """
         Подготовка dataloaders для обучения
         """
         print("\n📊 Подготовка датасета...")
         
-        # Создаем датасет
+        # Создаем датасет с fit_encoders=True
         dataset = AFMDataset(
             triplets_df=triplets_df,
             user_features=user_features,
             book_features=book_features,
-            fit_encoders=True
+            fit_encoders=True  # Важно!
         )
         
         # Разделяем на train/val
@@ -397,11 +397,19 @@ class AFMTrainer:
         
         print(f"   Train samples: {len(train_dataset)}")
         print(f"   Val samples: {len(val_dataset)}")
-        print(f"   User categories: {len(dataset.user_cat_cols)}")
-        print(f"   Book categories: {len(dataset.book_cat_cols)}")
+        print(f"   User numerical features: {len(dataset.user_num_cols)}")
+        print(f"   Book numerical features: {len(dataset.book_num_cols)}")
+        
+        # Сохраняем encoder'ы и scaler'ы из dataset
+        self.user_encoder = dataset.user_encoder
+        self.book_encoder = dataset.book_encoder
+        self.user_scaler = dataset.user_scaler
+        self.book_scaler = dataset.book_scaler
+        self.user_num_cols = dataset.user_num_cols
+        self.book_num_cols = dataset.book_num_cols
         
         return train_loader, val_loader, dataset
-    
+
     def create_model(self, dataset: AFMDataset) -> AFMRanker:
         """
         Создает модель с правильными размерами
@@ -409,10 +417,8 @@ class AFMTrainer:
         model = AFMRanker(
             user_count=len(dataset.user_encoder.classes_),
             book_count=len(dataset.book_encoder.classes_),
-            user_cat_dims=dataset.user_cat_dims,
-            book_cat_dims=dataset.book_cat_dims,
-            user_num_dim=len(dataset.user_numerical_cols),
-            book_num_dim=len(dataset.book_numerical_cols),
+            user_num_dim=len(dataset.user_num_cols),  # Изменено с user_numerical_cols
+            book_num_dim=len(dataset.book_num_cols),  # Изменено с book_numerical_cols
             embed_dim=self.embed_dim,
             attention_dim=self.attention_dim,
             dropout=self.dropout
@@ -423,9 +429,11 @@ class AFMTrainer:
         print(f"   Параметров: {total_params:,}")
         print(f"   User эмбеддингов: {len(dataset.user_encoder.classes_)}")
         print(f"   Book эмбеддингов: {len(dataset.book_encoder.classes_)}")
+        print(f"   User числовых фичей: {len(dataset.user_num_cols)}")
+        print(f"   Book числовых фичей: {len(dataset.book_num_cols)}")
         
         return model
-    
+
     def train(self, train_loader: DataLoader, val_loader: DataLoader) -> Tuple[list, list]:
         """
         Обучение модели
@@ -477,7 +485,121 @@ class AFMTrainer:
             print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
         
         return self.train_losses, self.val_losses
-    
+
+
+    def continue_training(self, 
+                        triplets_df: pd.DataFrame,
+                        user_features: pd.DataFrame,
+                        book_features: pd.DataFrame,
+                        additional_epochs: int = 5,
+                        learning_rate: Optional[float] = None,
+                        reset_optimizer: bool = False) -> 'AFMTrainer':
+        """
+        Продолжает обучение уже существующей модели
+        
+        Args:
+            triplets_df: данные для дообучения
+            user_features: фичи пользователей
+            book_features: фичи книг
+            additional_epochs: сколько дополнительных эпох обучить
+            learning_rate: новая learning rate (если None, использует текущую * 0.5)
+            reset_optimizer: сбросить ли оптимизатор (если меняем данные)
+        
+        Returns:
+            self
+        """
+        if self.model is None:
+            raise ValueError("Модель не загружена. Сначала вызовите load() или fit()")
+        
+        print("\n" + "="*60)
+        print(f"🔄 ПРОДОЛЖЕНИЕ ОБУЧЕНИЯ (+{additional_epochs} эпох)")
+        print("="*60)
+        
+        original_epochs = self.epochs
+        self.epochs += additional_epochs
+        
+        # Настраиваем learning rate
+        if learning_rate is None:
+            learning_rate = self.learning_rate * 0.5  # Уменьшаем LR для тонкой настройки
+            print(f"   Learning rate уменьшена: {self.learning_rate} → {learning_rate}")
+        
+        self.learning_rate = learning_rate
+        
+        # Создаем оптимизатор заново если нужно
+        if reset_optimizer:
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+            print("   Оптимизатор сброшен")
+        
+        # Подготовка данных (может быть только часть данных для дообучения)
+        train_loader, val_loader, _ = self.prepare_dataloaders(
+            triplets_df, user_features, book_features
+        )
+        
+        # Создаем scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=2, factor=0.5
+        )
+        
+        # Дополнительное обучение
+        start_epoch = len(self.train_losses)
+        
+        for epoch in range(additional_epochs):
+            # Training
+            self.model.train()
+            total_train_loss = 0
+            
+            train_bar = tqdm(train_loader, desc=f"Fine-tune Epoch {start_epoch+epoch+1}/{self.epochs} [Train]")
+            for batch in train_bar:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                self.optimizer.zero_grad()
+                loss, _, _ = self.model(batch)
+                loss.backward()
+                
+                # Gradient clipping для стабильности
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
+                
+                total_train_loss += loss.item()
+                train_bar.set_postfix({'loss': loss.item()})
+            
+            avg_train_loss = total_train_loss / len(train_loader)
+            self.train_losses.append(avg_train_loss)
+            
+            # Validation
+            self.model.eval()
+            total_val_loss = 0
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    loss, _, _ = self.model(batch)
+                    total_val_loss += loss.item()
+            
+            avg_val_loss = total_val_loss / len(val_loader)
+            self.val_losses.append(avg_val_loss)
+            
+            scheduler.step(avg_val_loss)
+            
+            print(f"Epoch {start_epoch+epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
+        
+        print("\n✅ Дообучение завершено!")
+        print(f"   Всего эпох: {self.epochs}")
+        print(f"   Best val loss: {min(self.val_losses):.4f}")
+        
+        return self
+
+
+    def set_optimizer(self):
+        """Создает или обновляет оптимизатор"""
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+
+
     def fit(self, triplets_df: pd.DataFrame, 
             user_features: pd.DataFrame, 
             book_features: pd.DataFrame) -> 'AFMTrainer':
@@ -496,48 +618,101 @@ class AFMTrainer:
         # Создание модели
         self.model = self.create_model(dataset)
         
+        # Создаем оптимизатор
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        
         # Обучение
         print(f"\n🚀 Начинаем обучение на {self.epochs} эпох...")
-        self.train(train_loader, val_loader)
         
-        # Сохраняем энкодеры и скейлеры из dataset
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=3, factor=0.5
+        )
+        
+        self.train_losses = []
+        self.val_losses = []
+        
+        for epoch in range(self.epochs):
+            # Training
+            self.model.train()
+            total_train_loss = 0
+            
+            train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs} [Train]")
+            for batch in train_bar:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                self.optimizer.zero_grad()
+                loss, _, _ = self.model(batch)
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
+                
+                total_train_loss += loss.item()
+                train_bar.set_postfix({'loss': loss.item()})
+            
+            avg_train_loss = total_train_loss / len(train_loader)
+            self.train_losses.append(avg_train_loss)
+            
+            # Validation
+            self.model.eval()
+            total_val_loss = 0
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    loss, _, _ = self.model(batch)
+                    total_val_loss += loss.item()
+            
+            avg_val_loss = total_val_loss / len(val_loader)
+            self.val_losses.append(avg_val_loss)
+            
+            scheduler.step(avg_val_loss)
+            
+            print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
+        
+        # Сохраняем encoder'ы и scaler'ы
         self.user_encoder = dataset.user_encoder
         self.book_encoder = dataset.book_encoder
         self.user_scaler = dataset.user_scaler
         self.book_scaler = dataset.book_scaler
-        self.user_cat_cols = dataset.user_cat_cols
-        self.book_cat_cols = dataset.book_cat_cols
-        self.user_numerical_cols = dataset.user_numerical_cols
-        self.book_numerical_cols = dataset.book_numerical_cols
-        self.user_clean_to_original = getattr(dataset, 'user_clean_to_original', {})
-        self.book_clean_to_original = getattr(dataset, 'book_clean_to_original', {})
+        self.user_num_cols = dataset.user_num_cols
+        self.book_num_cols = dataset.book_num_cols
         
         return self
-    
+
     def save(self, filepath: str = "models/afm_model.pth"):
         """Сохраняет модель и все необходимые компоненты"""
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
         
+        # Сохраняем всё, что нужно для восстановления
         torch.save({
             'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if hasattr(self, 'optimizer') else None,
             'user_encoder': self.user_encoder,
             'book_encoder': self.book_encoder,
             'user_scaler': self.user_scaler,
             'book_scaler': self.book_scaler,
-            'user_cat_cols': self.user_cat_cols,
-            'book_cat_cols': self.book_cat_cols,
-            'user_numerical_cols': self.user_numerical_cols,
-            'book_numerical_cols': self.book_numerical_cols,
-            'user_clean_to_original': self.user_clean_to_original,
-            'book_clean_to_original': self.book_clean_to_original,
+            'user_num_cols': self.user_num_cols,
+            'book_num_cols': self.book_num_cols,
             'embed_dim': self.embed_dim,
             'attention_dim': self.attention_dim,
+            'dropout': self.dropout,
             'train_losses': self.train_losses,
-            'val_losses': self.val_losses
+            'val_losses': self.val_losses,
+            'epochs': self.epochs,
+            'learning_rate': self.learning_rate,
         }, filepath)
         
         print(f"💾 Модель сохранена в {filepath}")
+        print(f"   Обучено эпох: {len(self.train_losses)}")
+        print(f"   Финальный train loss: {self.train_losses[-1]:.4f}")
+        print(f"   Финальный val loss: {self.val_losses[-1]:.4f}")
+
     
     def load(self, filepath: str = "models/afm_model.pth"):
         """Загружает модель и все компоненты"""
@@ -546,39 +721,31 @@ class AFMTrainer:
         if not filepath.exists():
             raise FileNotFoundError(f"Модель не найдена: {filepath}")
         
+        # Загружаем checkpoint
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         # Восстанавливаем параметры
         self.embed_dim = checkpoint['embed_dim']
         self.attention_dim = checkpoint['attention_dim']
+        self.dropout = checkpoint.get('dropout', 0.2)
+        self.epochs = checkpoint.get('epochs', self.epochs)
+        self.learning_rate = checkpoint.get('learning_rate', self.learning_rate)
+        
         self.user_encoder = checkpoint['user_encoder']
         self.book_encoder = checkpoint['book_encoder']
         self.user_scaler = checkpoint['user_scaler']
         self.book_scaler = checkpoint['book_scaler']
-        self.user_cat_cols = checkpoint['user_cat_cols']
-        self.book_cat_cols = checkpoint['book_cat_cols']
-        self.user_numerical_cols = checkpoint['user_numerical_cols']
-        self.book_numerical_cols = checkpoint['book_numerical_cols']
-        self.user_clean_to_original = checkpoint.get('user_clean_to_original', {})
-        self.book_clean_to_original = checkpoint.get('book_clean_to_original', {})
+        self.user_num_cols = checkpoint.get('user_num_cols', [])
+        self.book_num_cols = checkpoint.get('book_num_cols', [])
         self.train_losses = checkpoint.get('train_losses', [])
         self.val_losses = checkpoint.get('val_losses', [])
         
-        # Данные для предсказаний должны быть загружены отдельно
-        self.user_features = None
-        self.book_features = None
-        
-        # Создаем модель с правильными размерами
-        user_cat_dims = {col: 2 for col in self.user_cat_cols}
-        book_cat_dims = {col: 2 for col in self.book_cat_cols}
-        
+        # Создаем модель
         self.model = AFMRanker(
             user_count=len(self.user_encoder.classes_),
             book_count=len(self.book_encoder.classes_),
-            user_cat_dims=user_cat_dims,
-            book_cat_dims=book_cat_dims,
-            user_num_dim=len(self.user_numerical_cols),
-            book_num_dim=len(self.book_numerical_cols),
+            user_num_dim=len(self.user_num_cols),
+            book_num_dim=len(self.book_num_cols),
             embed_dim=self.embed_dim,
             attention_dim=self.attention_dim,
             dropout=self.dropout
@@ -587,18 +754,29 @@ class AFMTrainer:
         # Загружаем веса
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
+        # Восстанавливаем оптимизатор
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        if checkpoint.get('optimizer_state_dict') is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("   Оптимизатор восстановлен")
+        
+        self.user_features = None
+        self.book_features = None
+        
         print(f"📂 Модель загружена из {filepath}")
+        print(f"   Всего эпох: {len(self.train_losses)}")
+        print(f"   Финальный loss: {self.train_losses[-1] if self.train_losses else 'N/A':.4f}")
+        
         return self
-    
+
+
     def predict_for_user(self, user_id: int, book_ids: List[str], top_n: int = None) -> List[Tuple[str, float]]:
-        """
-        Предсказание для одного пользователя и списка книг
-        """
+        """Предсказание для одного пользователя и списка книг"""
         if self.model is None:
-            raise ValueError("Модель не загружена. Сначала вызовите fit() или load()")
+            raise ValueError("Модель не загружена")
         
         if self.user_features is None or self.book_features is None:
-            raise ValueError("Данные для предсказаний не загружены. Установите user_features и book_features")
+            raise ValueError("Данные не загружены")
         
         self.model.eval()
         
@@ -609,25 +787,16 @@ class AFMTrainer:
         
         user_idx = self.user_encoder.transform([user_id])[0]
         
-        # Подготовка фичей пользователя
+        # Числовые фичи пользователя
         if user_id in self.user_features.index:
             user_f = self.user_features.loc[user_id]
+            user_num_arr = self.user_scaler.transform(
+                [user_f[self.user_num_cols].fillna(0).values]
+            )[0]
         else:
-            user_f = pd.Series(index=self.user_features.columns, dtype=float).fillna(0)
+            user_num_arr = np.zeros(len(self.user_num_cols))
         
-        # Числовые фичи пользователя
-        user_numerical = torch.tensor(
-            self.user_scaler.transform([user_f[self.user_numerical_cols].fillna(0).values])[0], 
-            dtype=torch.float32
-        ).to(self.device)
-        
-        # Категориальные фичи пользователя - используем безопасный метод
-        user_categorical = []
-        for clean_col in self.user_cat_cols:
-            orig_col = self.user_clean_to_original.get(clean_col, clean_col)
-            val = self._get_categorical_value(user_f, orig_col)
-            user_categorical.append(val)
-        user_categorical = torch.tensor(user_categorical, dtype=torch.long).unsqueeze(0).to(self.device)
+        user_num = torch.tensor(user_num_arr, dtype=torch.float32, device=self.device)
         
         scores = []
         valid_books = []
@@ -638,51 +807,24 @@ class AFMTrainer:
             
             book_idx = self.book_encoder.transform([book_id])[0]
             
-            # Фичи книги
+            # Числовые фичи книги
             if book_id in self.book_features.index:
                 book_f = self.book_features.loc[book_id]
+                book_num_arr = self.book_scaler.transform(
+                    [book_f[self.book_num_cols].fillna(0).values]
+                )[0]
             else:
-                book_f = pd.Series(index=self.book_features.columns, dtype=float).fillna(0)
+                book_num_arr = np.zeros(len(self.book_num_cols))
             
-            # Числовые фичи книги
-            book_numerical = torch.tensor(
-                self.book_scaler.transform([book_f[self.book_numerical_cols].fillna(0).values])[0], 
-                dtype=torch.float32
-            ).to(self.device)
-            
-            # Категориальные фичи книги - используем безопасный метод
-            book_categorical = []
-            for clean_col in self.book_cat_cols:
-                orig_col = self.book_clean_to_original.get(clean_col, clean_col)
-                val = self._get_categorical_value(book_f, orig_col)
-                book_categorical.append(val)
-            book_categorical = torch.tensor(book_categorical, dtype=torch.long).unsqueeze(0).to(self.device)
+            book_num = torch.tensor(book_num_arr, dtype=torch.float32, device=self.device)
             
             with torch.no_grad():
-                batch = {
-                    'user_id': torch.tensor([user_idx], device=self.device),
-                    'pos_id': torch.tensor([book_idx], device=self.device),
-                    'neg_id': torch.tensor([0], device=self.device),
-                    'user_numerical': user_numerical.unsqueeze(0),
-                    'user_categorical': user_categorical,
-                    'pos_numerical': book_numerical.unsqueeze(0),
-                    'neg_numerical': torch.zeros_like(book_numerical).unsqueeze(0),
-                    'pos_categorical': book_categorical,
-                    'neg_categorical': torch.zeros_like(book_categorical),
-                    'weight': torch.tensor([1.0], device=self.device)
-                }
-                
-                emb = self.model.get_embedding(
-                    batch['user_id'], batch['pos_id'],
-                    batch['user_numerical'], batch['user_categorical'],
-                    batch['pos_numerical'], batch['pos_categorical']
+                # Используем forward_single для предсказания
+                score = self.model.forward_single(
+                    user_idx, book_idx,
+                    user_num.unsqueeze(0), book_num.unsqueeze(0)
                 )
-                
-                attn = torch.sigmoid(self.model.attention(emb))
-                weighted = emb * attn
-                score = self.model.predict(weighted).squeeze().item()
-                
-                scores.append(score)
+                scores.append(score.item())
                 valid_books.append(book_id)
         
         # Сортируем по убыванию
@@ -692,7 +834,6 @@ class AFMTrainer:
             results = results[:top_n]
         
         return results
-    
 
     def predict_for_all_users(self, candidates_dict: Dict[int, Dict[str, float]], 
                             top_n: int = 10,
