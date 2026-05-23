@@ -117,6 +117,7 @@ class TrainTestSplitter:
     
 from app.services.collab_filter import CollaborativeFilter, PopularityFallback, CandidateAnalyzer
 
+
 class CollaborativeGenerator:
     """Генерация кандидатов коллаборативной фильтрацией"""
     
@@ -124,44 +125,53 @@ class CollaborativeGenerator:
         self.n_candidates = n_candidates
         self.cf = CollaborativeFilter()
         self.fallback = PopularityFallback()
-        self.analyzer = CandidateAnalyzer()
         self.candidates = None
     
-    def generate(self, train_ratings: pd.DataFrame, test_ratings: pd.DataFrame = None) -> Dict:
+    def generate(self, train_ratings: pd.DataFrame, 
+                 test_ratings: pd.DataFrame = None,
+                 books_df: pd.DataFrame = None) -> Dict:
         """
         Полный pipeline генерации кандидатов
         """
-        # 1. Генерация кандидатов коллаборативной фильтрацией
+        if books_df is None:
+            raise ValueError("books_df обязателен для генерации кандидатов от авторов")
+        
+        # 1. Генерация кандидатов коллаборативной фильтрацией + авторские
         self.candidates = self.cf.generate_candidates(
             train_ratings, 
+            books_df,
             n_recommendations=self.n_candidates
         )
         
         # 2. Добавляем популярные книги для малоактивных пользователей
-        popular_books = self.fallback.get_top_popular_books(train_ratings, n=200)
-        inactive_users = self.fallback.get_inactive_users(train_ratings, min_books=10)
+        popular_books = self.fallback.get_top_popular_books(train_ratings, n=500)
+        inactive_users = self.fallback.get_inactive_users(train_ratings, min_books=100)
         
         self.candidates = self.fallback.add_popular_to_inactive(
             recommendations=self.candidates, 
             inactive_users=inactive_users, 
+            train_ratings=train_ratings,
             popular_books=popular_books,
-            add_ratio=0.1,  # 10% от текущих рекомендаций
-            random_seed=42
+            books_df=books_df,
+            add_ratio=0.05
         )
         
         # 3. Анализ качества (если есть тестовые данные)
         if test_ratings is not None:
-            coverage = self.analyzer.analyze_coverage(self.candidates, test_ratings)
+            from app.services.collab_filter import CandidateAnalyzer
+            analyzer = CandidateAnalyzer()
+            coverage = analyzer.analyze_coverage(self.candidates, test_ratings)
             print(f"\n📊 Покрытие тестовых пользователей: {coverage['coverage_rate']:.1%}")
             
-            hit_rate = self.analyzer.calculate_hit_rate(self.candidates, test_ratings)
+            hit_rate = analyzer.calculate_hit_rate(self.candidates, test_ratings)
             print(f"   Hit rate: {hit_rate['mean_hit_rate']:.3f}")
         
         # 4. Сохраняем кандидатов
         self.cf.save_candidates()
         
         return self.candidates
-    
+
+
 import pandas as pd
 import pickle
 from pathlib import Path
@@ -173,7 +183,10 @@ class FeaturePipeline:
     """Pipeline для формирования фичей и триплетов"""
     
     def __init__(self):
-        self.book_fe = BookFeatureEngineer()
+        self.book_fe = BookFeatureEngineer(
+            author_popularity_threshold=800,
+            use_reads_based_popularity=True
+        )
         self.user_fe = UserFeatureEngineer()
         self.triplet_gen = TripletGenerator()
         self.book_features = None
@@ -201,7 +214,7 @@ class FeaturePipeline:
         
         # 1. Контентные фичи книг (без рейтингов)
         print("\n📚 Шаг 1: Контентные фичи книг...")
-        book_content_features = self.book_fe.create_book_features_without_ratings(books)
+        book_content_features = self.book_fe.create_book_features_without_ratings(books, train_ratings)
         print(f"   Создано {len(book_content_features)} книг с {len(book_content_features.columns)} контентными фичами")
         
         # 2. Добавляем статистики из тренировочных рейтингов

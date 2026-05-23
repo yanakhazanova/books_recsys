@@ -91,19 +91,26 @@ async def split_train_test(
 async def generate_candidates(
     n_candidates: int = Query(1000, description="Количество кандидатов на пользователя")
 ):
-    """Генерация кандидатов коллаборативной фильтрацией"""
+    """Генерация кандидатов коллаборативной фильтрацией + от авторов"""
+    global state
     
     try:
-        # Загружаем сплиты из кэша
         if state.train_ratings is None:
             state.train_ratings, state.test_ratings = data_cache.load_split()
         
         if state.train_ratings is None:
             raise HTTPException(status_code=400, detail="Данные не разделены. Сначала вызовите /split")
         
+        if state.books_df is None:
+            _, state.books_df, _ = data_cache.load_cleaned_data()
+        
         # Генерируем кандидатов
         generator = CollaborativeGenerator(n_candidates=n_candidates)
-        state.candidates = generator.generate(state.train_ratings, state.test_ratings)
+        state.candidates = generator.generate(
+            state.train_ratings, 
+            state.test_ratings,
+            state.books_df
+        )
         
         # Сохраняем кандидатов в кэш
         data_cache.save_candidates(state.candidates)

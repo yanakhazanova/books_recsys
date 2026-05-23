@@ -7,6 +7,9 @@ from typing import Dict, Tuple, Optional, List
 from pathlib import Path
 import pickle
 
+from app.services.utils import normalize_author_name, clean_column_name
+
+
 class CollaborativeFilter:
     """Коллаборативная фильтрация на основе preference_score"""
     
@@ -87,16 +90,13 @@ class CollaborativeFilter:
     
     def generate_candidates(self, 
                            train_ratings: pd.DataFrame,
+                           books_df: pd.DataFrame,
                            n_recommendations: int = 1000) -> Dict[int, Dict[str, float]]:
         """
         Генерация кандидатов для всех пользователей
-        
-        Args:
-            train_ratings: тренировочные данные
-            n_recommendations: количество кандидатов на пользователя
-            
-        Returns:
-            dict: {user_id: {isbn: score}}
+        Теперь включает:
+        1. Кандидаты от коллаборативной фильтрации
+        2. Кандидаты от популярных авторов (по 2 книги на автора из истории)
         """
         print("\n🚀 Генерация кандидатов коллаборативной фильтрацией...")
         
@@ -108,8 +108,6 @@ class CollaborativeFilter:
         print("1. Расчет косинусной схожести...")
         user_similarity = cosine_similarity(preferences)
         np.fill_diagonal(user_similarity, 0)
-        
-        # Отсекаем низкие схожести
         user_similarity[user_similarity < self.similarity_threshold] = 0
         
         # 2. Взвешенные предсказания
@@ -117,31 +115,107 @@ class CollaborativeFilter:
         weighted_sum = user_similarity.dot(preferences)
         similarity_sum = np.abs(user_similarity).dot(interaction_mask)
         similarity_sum[similarity_sum == 0] = 1
-        
         predictions = weighted_sum / similarity_sum
-        
-        # Игнорируем уже прочитанные книги
         predictions[interaction_mask > 0] = -np.inf
         
-        # 3. Формирование топ-рекомендаций
-        print(f"3. Формирование топ-{n_recommendations} кандидатов...")
+        # 3. Формирование топ-рекомендаций от CF
+        print(f"3. Формирование топ-{n_recommendations} кандидатов от CF...")
         top_n_indices = np.argsort(predictions, axis=1)[:, -n_recommendations:][:, ::-1]
         
-        # Сбор результатов
         recommendations = {}
         item_ids = user_item_matrix.columns.values
         
-        for i, user in enumerate(tqdm(user_item_matrix.index, desc="Обработка пользователей")):
+        for i, user in enumerate(tqdm(user_item_matrix.index, desc="CF рекомендации")):
             top_items = item_ids[top_n_indices[i]]
             top_scores = predictions[i, top_n_indices[i]]
-            
-            # Фильтруем некорректные предсказания
             valid = (top_scores > -np.inf) & (top_scores >= 0)
             if valid.any():
                 recommendations[user] = dict(zip(top_items[valid], top_scores[valid]))
         
+        # 4. Добавляем кандидатов от авторов из истории пользователя
+        print("\n📚 Добавление кандидатов от популярных авторов из истории...")
+        recommendations = self._add_author_based_candidates(
+            recommendations, train_ratings, books_df, n_recommendations
+        )
+        
         self.recommendations = recommendations
         print(f"\n✅ Сгенерировано кандидатов для {len(recommendations)} пользователей")
+        
+        return recommendations
+    
+    def _add_author_based_candidates(self, 
+                                     recommendations: Dict[int, Dict[str, float]],
+                                     train_ratings: pd.DataFrame,
+                                     books_df: pd.DataFrame,
+                                     target_total: int = 1000) -> Dict[int, Dict[str, float]]:
+        """
+        Добавляет кандидатов от авторов из истории пользователя:
+        - Для каждого пользователя находим всех авторов, которых он читал
+        - Для каждого автора добавляем 2 самые популярные книги, которые пользователь еще не читал
+        """
+        # Нормализуем авторов в books_df
+        books_df = books_df.copy()
+        books_df['Author_norm'] = books_df['Author'].apply(normalize_author_name)
+        
+        # Считаем популярность книг по авторам (количество прочтений)
+        book_popularity = train_ratings.groupby('ISBN').size()
+        books_df['book_popularity'] = books_df['ISBN'].map(book_popularity).fillna(0)
+        
+        # Для каждого автора находим топ-5 самых популярных книг
+        author_top_books = {}
+        for author in books_df['Author_norm'].unique():
+            author_books = books_df[books_df['Author_norm'] == author]
+            # Сортируем по популярности и берем топ-5
+            top_books = author_books.nlargest(5, 'book_popularity')['ISBN'].tolist()
+            author_top_books[author] = top_books
+        
+        # Нормализуем авторов в train_ratings через books_df
+        books_with_authors = books_df[['ISBN', 'Author_norm']].drop_duplicates('ISBN')
+        train_with_authors = train_ratings.merge(books_with_authors, on='ISBN', how='left')
+        
+        # Для каждого пользователя собираем авторов из истории
+        user_authors = train_with_authors.groupby('User-ID')['Author_norm'].apply(
+            lambda x: set(x.dropna())
+        ).to_dict()
+        
+        print(f"   Уникальных авторов в истории: {len(set([a for users in user_authors.values() for a in users]))}")
+        
+        added_count = 0
+        users_with_new_candidates = 0
+        
+        for user_id, user_recs in tqdm(recommendations.items(), desc="Добавление авторских кандидатов"):
+            # Какие книги пользователь уже читал
+            user_read_books = set(train_ratings[train_ratings['User-ID'] == user_id]['ISBN'])
+            
+            # Авторы, которых пользователь читал
+            authors_read = user_authors.get(user_id, set())
+            
+            new_candidates = {}
+            
+            for author in authors_read:
+                # Берем топ-5 книг автора
+                top_books = author_top_books.get(author, [])
+                # Выбираем книги, которые пользователь еще не читал
+                new_books = [book for book in top_books if book not in user_read_books]
+                
+                # Добавляем по 2 книги от каждого автора
+                for book in new_books[:2]:
+                    if book not in user_recs:
+                        # Вес 0.2 - чуть выше, чем у случайных популярных книг
+                        new_candidates[book] = 0.2
+            
+            if new_candidates:
+                user_recs.update(new_candidates)
+                added_count += len(new_candidates)
+                users_with_new_candidates += 1
+        
+        print(f"   Добавлено {added_count} кандидатов от авторов для {users_with_new_candidates} пользователей")
+        
+        # Обрезаем до target_total, оставляя топ по score
+        for user_id in recommendations:
+            if len(recommendations[user_id]) > target_total:
+                sorted_items = sorted(recommendations[user_id].items(), key=lambda x: x[1], reverse=True)
+                recommendations[user_id] = dict(sorted_items[:target_total])
         
         return recommendations
     
@@ -168,27 +242,50 @@ class CollaborativeFilter:
 
 
 class PopularityFallback:
-    """Фоллбэк с популярными книгами для малоактивных пользователей"""
+    """Фоллбэк с популярными книгами и авторами для малоактивных пользователей"""
     
     @staticmethod
-    def get_top_popular_books(train_ratings: pd.DataFrame, n: int = 200) -> List[str]:
-        """
-        Возвращает список n самых популярных книг
-        """
+    def get_top_popular_books(train_ratings: pd.DataFrame, n: int = 500) -> List[str]:
+        """Возвращает список n самых популярных книг"""
         book_popularity = train_ratings['ISBN'].value_counts()
         top_books = book_popularity.head(n).index.tolist()
         
         print(f"📚 Топ-{n} популярных книг:")
         print(f"   Самая популярная: {top_books[0]} ({book_popularity.iloc[0]} взаимодействий)")
-        print(f"   {n}-я по популярности: {top_books[-1]} ({book_popularity.iloc[n-1]} взаимодействий)")
         
         return top_books
     
     @staticmethod
+    def get_popular_books_by_author(train_ratings: pd.DataFrame, 
+                                     books_df: pd.DataFrame, 
+                                     n_books_per_author: int = 3,
+                                     top_authors: int = 100) -> Dict[str, List[str]]:
+        """
+        Возвращает для каждого популярного автора список его самых популярных книг
+        """
+        # Нормализуем авторов
+        books_df = books_df.copy()
+        books_df['Author_norm'] = books_df['Author'].apply(normalize_author_name)
+        
+        # Считаем популярность книг
+        book_popularity = train_ratings.groupby('ISBN').size()
+        books_df['book_popularity'] = books_df['ISBN'].map(book_popularity).fillna(0)
+        
+        # Считаем популярность авторов
+        author_popularity = books_df.groupby('Author_norm')['book_popularity'].sum().sort_values(ascending=False)
+        top_authors_list = author_popularity.head(top_authors).index.tolist()
+        
+        author_books = {}
+        for author in top_authors_list:
+            author_books_df = books_df[books_df['Author_norm'] == author]
+            top_books = author_books_df.nlargest(n_books_per_author, 'book_popularity')['ISBN'].tolist()
+            author_books[author] = top_books
+        
+        return author_books
+    
+    @staticmethod
     def get_inactive_users(train_ratings: pd.DataFrame, min_books: int = 20) -> List[int]:
-        """
-        Возвращает список пользователей с меньше чем min_books книг
-        """
+        """Возвращает список пользователей с меньше чем min_books книг"""
         user_activity = train_ratings.groupby('User-ID').size()
         inactive_users = user_activity[user_activity < min_books].index.tolist()
         
@@ -197,71 +294,66 @@ class PopularityFallback:
         
         return inactive_users
     
-
     @staticmethod
     def add_popular_to_inactive(recommendations: Dict, 
-                            inactive_users: List[int], 
-                            popular_books: List[str], 
-                            add_ratio: float = 0.1,
-                            random_seed: int = 42) -> Dict:
+                                inactive_users: List[int], 
+                                popular_books: List[str], 
+                                train_ratings: pd.DataFrame,
+                                books_df: pd.DataFrame,
+                                add_ratio: float = 0.1,
+                                random_seed: int = 42) -> Dict:
         """
-        Добавляет случайные популярные книги к рекомендациям малоактивных пользователей
-        
-        Args:
-            recommendations: словарь с рекомендациями {user_id: {isbn: score}}
-            inactive_users: список малоактивных пользователей
-            popular_books: список популярных книг (из которых будем выбирать случайные)
-            add_ratio: доля популярных книг от текущего количества рекомендаций (0.1 = 10%)
-            random_seed: для воспроизводимости результатов
+        Добавляет случайные популярные книги и книги популярных авторов
+        для малоактивных пользователей
         """
         import random
         random.seed(random_seed)
         np.random.seed(random_seed)
         
+        # Получаем популярные книги по авторам
+        popular_by_author = PopularityFallback.get_popular_books_by_author(
+            train_ratings, books_df, n_books_per_author=3, top_authors=50
+        )
+        all_popular_by_author_books = []
+        for books_list in popular_by_author.values():
+            all_popular_by_author_books.extend(books_list)
+        
         updated_recommendations = recommendations.copy()
         total_added = 0
         
-        for user in inactive_users:
+        for user in tqdm(inactive_users, desc="Добавление популярных книг"):
             if user not in updated_recommendations:
-                # Если нет рекомендаций - пропускаем (такого быть не должно)
                 continue
             
             current_recs = updated_recommendations[user]
             n_current = len(current_recs)
-            
-            # Сколько книг добавить (10% от текущего количества, минимум 1)
             n_to_add = max(1, int(n_current * add_ratio))
             
-            # Какие книги уже есть
             existing_books = set(current_recs.keys())
             
-            # Выбираем случайные популярные книги, которых еще нет в рекомендациях
-            available_books = [book for book in popular_books if book not in existing_books]
+            # Смешиваем обычные популярные книги и книги от популярных авторов
+            available_books = [b for b in popular_books if b not in existing_books]
+            available_author_books = [b for b in all_popular_by_author_books if b not in existing_books]
             
-            if len(available_books) < n_to_add:
-                # Если недостаточно популярных книг, берем сколько есть
-                n_to_add = len(available_books)
+            # Берем 50% от обычных популярных и 50% от авторских
+            n_normal = n_to_add // 2
+            n_author = n_to_add - n_normal
             
-            if n_to_add > 0:
-                # Случайный выбор популярных книг
-                chosen_books = random.sample(available_books, n_to_add)
-                
-                # Добавляем с небольшим весом (0.1)
-                for book in chosen_books:
-                    current_recs[book] = 0.1
-                
-                total_added += n_to_add
-                
-                # Небольшой вывод для отладки
-                if random.random() < 0.01:  # Печатаем для ~1% пользователей
-                    print(f"   Пользователь {user}: добавлено {n_to_add} популярных книг "
-                        f"(было {n_current}, стало {len(current_recs)})")
+            chosen_books = []
+            if available_books and n_normal > 0:
+                chosen_books.extend(random.sample(available_books, min(n_normal, len(available_books))))
+            if available_author_books and n_author > 0:
+                chosen_books.extend(random.sample(available_author_books, min(n_author, len(available_author_books))))
+            
+            for book in chosen_books:
+                current_recs[book] = 0.1
+            
+            total_added += len(chosen_books)
         
-        print(f"✅ Добавлено {total_added} случайных популярных книг для {len(inactive_users)} малоактивных пользователей")
-        print(f"   В среднем: {total_added/len(inactive_users):.1f} книг на пользователя")
+        print(f"✅ Добавлено {total_added} популярных книг для {len(inactive_users)} малоактивных пользователей")
         
         return updated_recommendations
-
+    
 
 class CandidateAnalyzer:
     """Анализ качества сгенерированных кандидатов"""

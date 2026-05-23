@@ -36,7 +36,7 @@ class DataLoader:
             'users': self.users
         }
     
-    def clean_data(self, min_book_interactions: int = 10, min_user_interactions: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def clean_data(self, min_book_interactions: int = 15, min_user_interactions: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Очистка данных: приведение типов, фильтрация редких книг и пользователей"""
         
         print("🧹 Очистка данных...")

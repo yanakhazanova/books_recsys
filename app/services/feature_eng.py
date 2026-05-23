@@ -1,19 +1,65 @@
-# app/services/feature_eng.py
 import pandas as pd
 import numpy as np
+import re
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from scipy import stats
 from typing import Tuple, Dict
 import pickle
 import joblib
 
+
+from app.services.utils import normalize_author_name, clean_column_name
+
+
 class BookFeatureEngineer:
     """Инжиниринг фичей для книг (только контентные фичи, без утечек)"""
     
-    def __init__(self):
+    def __init__(self, 
+                 author_popularity_threshold: int = 800,  # порог по прочтениям
+                 use_reads_based_popularity: bool = True):  # использовать прочтения вместо книг
+        """
+        Args:
+            author_popularity_threshold: порог популярности автора (по прочтениям)
+            use_reads_based_popularity: True - использовать прочтения, False - количество книг
+        """
         self.scaler = StandardScaler()
         self.ohe = None
         self.fitted = False
+        self.author_popularity_threshold = author_popularity_threshold
+        self.use_reads_based_popularity = use_reads_based_popularity
+        self.popular_authors = None  # будет хранить список популярных авторов
+        self.author_stats = None  # будет хранить статистику по авторам
+    
+    def _calculate_author_popularity(self, books: pd.DataFrame, 
+                                      train_ratings: pd.DataFrame = None) -> pd.Series:
+        """
+        Рассчитывает популярность авторов:
+        - Если use_reads_based_popularity=True: по количеству прочтений (из train_ratings)
+        - Если False: по количеству книг автора
+        """
+        if self.use_reads_based_popularity:
+            if train_ratings is None:
+                raise ValueError("Для определения популярности по прочтениям нужны train_ratings")
+            
+            # Нормализуем авторов
+            books['Author_norm'] = books['Author'].apply(normalize_author_name)
+            
+            # Считаем прочтения для каждой книги
+            book_reads = train_ratings.groupby('ISBN').size()
+            
+            # Присоединяем к книгам
+            books_with_reads = books.set_index('ISBN')[['Author_norm']].copy()
+            books_with_reads['num_reads'] = book_reads
+            books_with_reads = books_with_reads.dropna(subset=['num_reads'])
+            
+            # Суммируем прочтения по авторам
+            author_reads = books_with_reads.groupby('Author_norm')['num_reads'].sum()
+            return author_reads
+        else:
+            # Подход по количеству книг
+            books['Author_norm'] = books['Author'].apply(normalize_author_name)
+            author_books = books.groupby('Author_norm')['ISBN'].count()
+            return author_books
     
     def create_content_features(self, books: pd.DataFrame) -> pd.DataFrame:
         """
@@ -22,27 +68,13 @@ class BookFeatureEngineer:
         """
         books = books.copy()
         
+        # Нормализуем авторов
+        books['Author_norm'] = books['Author'].apply(normalize_author_name)
+        
         # Очистка названия
         books['Title'] = books['Title'].str.replace(r'\(.*?\)', '', regex=True)
         books['Title'] = books['Title'].str.replace(r'[^\w\s]', '', regex=True)
         books['Title'] = books['Title'].str.lower()
-        
-        # Популярность автора (только на основе самих книг, не рейтингов)
-        books['Author_mentioned'] = books.groupby('Author')['ISBN'].transform('count')
-        books['is_popular_author'] = (books['Author_mentioned'] > 10).astype(int)
-        
-        books['Author_popular'] = np.where(
-            books['is_popular_author'] == 1, 
-            books['Author'], 
-            'unpopular'
-        )
-        
-        # Популярность издателя (только на основе самих книг)
-        books['Publisher_popular'] = np.where(
-            books.groupby('Publisher')['Publisher'].transform('count') > 100,
-            books['Publisher'],
-            'unpopular'
-        )
         
         # Возраст книги
         current_year = 2026
@@ -62,19 +94,49 @@ class BookFeatureEngineer:
         
         return books
     
-    def create_book_features_without_ratings(self, books: pd.DataFrame) -> pd.DataFrame:
+    def add_author_popularity_feature(self, books: pd.DataFrame, 
+                                       train_ratings: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Добавляет фичу популярности автора
+        """
+        books = books.copy()
+        
+        # Рассчитываем популярность авторов
+        author_popularity = self._calculate_author_popularity(books, train_ratings)
+        
+        # Определяем популярных авторов
+        popular_authors = author_popularity[author_popularity >= self.author_popularity_threshold].index
+        self.popular_authors = popular_authors
+        self.author_stats = author_popularity
+        
+        print(f"   Популярных авторов (>= {self.author_popularity_threshold} прочтений): {len(popular_authors)}")
+        print(f"   One-Hot колонок для авторов: {len(popular_authors) - 1 if len(popular_authors) > 0 else 0}")
+        
+        # Создаем категориальную метку
+        books['Author_popular'] = books['Author_norm'].apply(
+            lambda x: x if x in popular_authors else 'unpopular'
+        )
+        
+        # Добавляем статистику по издателю
+        publisher_counts = books['Publisher'].value_counts()
+        books['Publisher_popular'] = np.where(
+            books['Publisher'].map(publisher_counts) > 100,
+            books['Publisher'],
+            'unpopular'
+        )
+        
+        return books
+    
+    def create_book_features_without_ratings(self, books: pd.DataFrame, 
+                                              train_ratings: pd.DataFrame = None) -> pd.DataFrame:
         """
         Создает фичи книг только на основе контента (без статистик из рейтингов)
         """
         books = self.create_content_features(books)
+        books = self.add_author_popularity_feature(books, train_ratings)
         
         # Числовые фичи
         numeric_features = books[['ISBN', 'Year', 'publisher_book_count', 'book_age', 'is_classic']].copy()
-        
-        if 'Author_mentioned' in books.columns:
-            numeric_features['Author_mentioned'] = books['Author_mentioned']
-        if 'is_popular_author' in books.columns:
-            numeric_features['is_popular_author'] = books['is_popular_author']
         
         # One-Hot Encoding для категориальных
         categorical_cols = ['Author_popular', 'Publisher_popular', 'Year_era']
@@ -83,7 +145,7 @@ class BookFeatureEngineer:
         if categorical_cols:
             self.ohe = OneHotEncoder(sparse_output=False, drop='first')
             encoded_features = self.ohe.fit_transform(books[categorical_cols])
-
+            
             clean_columns = [clean_column_name(col) for col in self.ohe.get_feature_names_out(categorical_cols)]
             
             encoded_df = pd.DataFrame(
@@ -97,6 +159,8 @@ class BookFeatureEngineer:
             book_features = numeric_features
         
         book_features = book_features.set_index('ISBN')
+        
+        print(f"   Создано контентных фичей: {len(book_features.columns)}")
         
         return book_features
     
@@ -150,9 +214,7 @@ class BookFeatureEngineer:
         book_features = book_features.fillna(default_values)
         
         # Нормализация числовых фичей (только на тренировочных данных)
-        numerical_cols = ['book_rating_count', 'book_avg_rating', 'book_rating_std', 
-                          'book_min_rating', 'book_max_rating', 'unique_users_rated',
-                          'wilson_score', 'popularity_norm', 'book_age', 'publisher_book_count']
+        numerical_cols = ['book_rating_count', 'book_avg_rating', 'popularity_norm', 'book_age', 'publisher_book_count']
         
         # Проверяем, какие колонки реально существуют
         numerical_cols = [col for col in numerical_cols if col in book_features.columns]
@@ -194,7 +256,6 @@ class UserFeatureEngineer:
         """
         # Возрастные категории
         users = users.copy()
-        users['is_age_known'] = users['Age'].apply(lambda x: x if pd.notnull(x) else 'unknown')
         
         bins = [0, 10, 20, 30, 40, 50, 60, 70, float('inf')]
         labels = ['<10', '10-20', '20-30', '30-40', '40-50', '50-60', '60-70', '>70']
@@ -207,7 +268,7 @@ class UserFeatureEngineer:
         age_encoded = self.ohe_age.fit_transform(users[['age_category']])
         age_df = pd.DataFrame(
             age_encoded,
-            columns=self.ohe_age.get_feature_names_out(['age_category']),
+            columns=[f'age_{col}' for col in self.ohe_age.get_feature_names_out(['age_category'])],
             index=users.index
         )
         
@@ -252,7 +313,7 @@ class UserFeatureEngineer:
         activity_encoded = self.ohe_activity.fit_transform(user_stats[['user_activity_level']])
         activity_df = pd.DataFrame(
             activity_encoded,
-            columns=self.ohe_activity.get_feature_names_out(['user_activity_level']),
+            columns=[f'activity_{col}' for col in self.ohe_activity.get_feature_names_out(['user_activity_level'])],
             index=user_stats.index
         )
         
@@ -260,10 +321,6 @@ class UserFeatureEngineer:
         user_features = user_stats.drop('user_activity_level', axis=1)
         user_features = pd.concat([user_features, activity_df, age_df], axis=1)
         user_features = user_features.set_index('User-ID')
-        
-        # Переименовываем колонки
-        user_features.columns = user_features.columns.str.replace('user_activity_level_', 'activity_')
-        user_features.columns = user_features.columns.str.replace('age_category_', 'age_')
         
         # Нормализуем числовые фичи
         numerical_cols = ['user_rating_count', 'non_zero_ratings_count', 'zero_ratings_count',
@@ -280,17 +337,6 @@ class UserFeatureEngineer:
         print(f"✅ Создано {len(user_features)} пользователей с {len(user_features.columns)} фичами")
         
         return user_features
-    
-    def transform_user_features(self, users: pd.DataFrame, train_ratings: pd.DataFrame) -> pd.DataFrame:
-        """
-        Применяет уже обученные преобразования к новым пользователям
-        """
-        if not self.fitted:
-            raise ValueError("Feature engineer не обучен. Сначала вызовите create_user_features")
-        
-        # Аналогичная логика, но используем обученные scaler и encoders
-        # (для production использования)
-        pass
 
 
 class TripletGenerator:
@@ -352,16 +398,3 @@ class TripletGenerator:
         print(f"✅ Сгенерировано {len(triplets_df)} триплетов из тренировочных данных")
         
         return triplets_df
-    
-def clean_column_name(name: str) -> str:
-    """Очищает имя колонки для безопасного использования"""
-    import re
-    # Заменяем точки, пробелы, дефисы на подчеркивания
-    cleaned = str(name).replace('.', '_').replace(' ', '_').replace('-', '_')
-    # Удаляем другие проблемные символы
-    cleaned = ''.join(c if c.isalnum() or c == '_' else '_' for c in cleaned)
-    # Убираем множественные подчеркивания
-    cleaned = re.sub(r'_+', '_', cleaned)
-    # Убираем подчеркивание в начале и конце
-    cleaned = cleaned.strip('_')
-    return cleaned
