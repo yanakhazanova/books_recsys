@@ -240,6 +240,29 @@ class FeaturePipeline:
         print(f"   Количество триплетов: {len(self.triplets)}")
         print("=" * 60)
         
+        print(f"\n📊 ПРОВЕРКА ФИЧЕЙ ПЕРЕД ОБУЧЕНИЕМ:")
+        print(f"   User features shape: {self.user_features.shape}")
+        print(f"   User features columns ({len(self.user_features.columns)}):")
+        for i, col in enumerate(self.user_features.columns[:15]):
+            print(f"      {i+1}. {col} (type: {self.user_features[col].dtype})")
+        if len(self.user_features.columns) > 15:
+            print(f"      ... и еще {len(self.user_features.columns)-15} колонок")
+        
+        print(f"\n   Book features shape: {self.book_features.shape}")
+        print(f"   Book features columns ({len(self.book_features.columns)}):")
+        for i, col in enumerate(self.book_features.columns[:15]):
+            print(f"      {i+1}. {col} (type: {self.book_features[col].dtype})")
+        if len(self.book_features.columns) > 15:
+            print(f"      ... и еще {len(self.book_features.columns)-15} колонок")
+        
+        # Проверяем наличие one-hot колонок
+        ohe_cols = [col for col in self.book_features.columns if any(x in col for x in ['Author_popular', 'Publisher_popular', 'Year_era'])]
+        if ohe_cols:
+            print(f"\n   ✅ Найдено one-hot колонок: {len(ohe_cols)}")
+            print(f"      Примеры: {ohe_cols[:5]}")
+        else:
+            print(f"\n   ⚠️  ВНИМАНИЕ: Не найдено one-hot колонок! Author_popular не закодированы?")
+
         return self.book_features, self.user_features, self.triplets
     
     def save(self, filepath: str = "models/features_and_scalers.pkl"):
@@ -379,6 +402,11 @@ class AFMTrainer:
         """
         print("\n📊 Подготовка датасета...")
         
+        print(f"\n🔍 ВХОДНЫЕ ДАННЫЕ ДЛЯ DATASET:")
+        print(f"   user_features shape: {user_features.shape}")
+        print(f"   book_features shape: {book_features.shape}")
+        print(f"   triplets count: {len(triplets_df)}")
+
         # Создаем датасет с fit_encoders=True
         dataset = AFMDataset(
             triplets_df=triplets_df,
@@ -387,6 +415,16 @@ class AFMTrainer:
             fit_encoders=True  # Важно!
         )
         
+        print(f"\n✅ ДАТАСЕТ СОЗДАН:")
+        print(f"   User числовых колонок: {len(dataset.user_num_cols)}")
+        print(f"   Book числовых колонок: {len(dataset.book_num_cols)}")
+        print(f"   Всего признаков на входе: {len(dataset.user_num_cols) + len(dataset.book_num_cols)}")
+        
+        if hasattr(dataset, 'user_num_cols') and dataset.user_num_cols:
+            print(f"   Примеры user_num_cols: {dataset.user_num_cols[:5]}")
+        if hasattr(dataset, 'book_num_cols') and dataset.book_num_cols:
+            print(f"   Примеры book_num_cols: {dataset.book_num_cols[:5]}")
+
         # Разделяем на train/val
         train_size = int((1 - self.val_split) * len(dataset))
         val_size = len(dataset) - train_size
@@ -427,6 +465,19 @@ class AFMTrainer:
         """
         Создает модель с правильными размерами
         """
+
+        print(f"\n🏗️  СОЗДАНИЕ МОДЕЛИ:")
+        print(f"   user_count: {len(dataset.user_encoder.classes_)}")
+        print(f"   book_count: {len(dataset.book_encoder.classes_)}")
+        print(f"   user_num_dim: {len(dataset.user_num_cols)}")
+        print(f"   book_num_dim: {len(dataset.book_num_cols)}")
+        print(f"   Всего числовых признаков: {len(dataset.user_num_cols) + len(dataset.book_num_cols)}")
+        
+        if len(dataset.user_num_cols) < 10:
+            print(f"   ⚠️  ВНИМАНИЕ: Мало user признаков ({len(dataset.user_num_cols)}). Ожидалось больше!")
+        if len(dataset.book_num_cols) < 50:
+            print(f"   ⚠️  ВНИМАНИЕ: Мало book признаков ({len(dataset.book_num_cols)}). Ожидалось больше (есть one-hot?).")
+
         model = AFMRanker(
             user_count=len(dataset.user_encoder.classes_),
             book_count=len(dataset.book_encoder.classes_),

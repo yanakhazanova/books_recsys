@@ -41,45 +41,34 @@ class SHAPAnalyzer:
         """Определяет список всех признаков для SHAP"""
         self.user_num_features = []
         self.book_num_features = []
-        self.user_cat_features = []
-        self.book_cat_features = []
         
-        if hasattr(self.trainer, 'user_num_cols'):
+        # Берем ВСЕ числовые колонки из trainer
+        if hasattr(self.trainer, 'user_num_cols') and self.trainer.user_num_cols:
             self.user_num_features = self.trainer.user_num_cols
-        elif hasattr(self.trainer, 'user_numerical_cols'):
-            self.user_num_features = self.trainer.user_numerical_cols
+        elif hasattr(self.trainer, 'user_features') and self.trainer.user_features is not None:
+            # Все числовые колонки из user_features
+            self.user_num_features = self.trainer.user_features.select_dtypes(include=[np.number]).columns.tolist()
+            # Убираем индекс если есть
+            self.user_num_features = [col for col in self.user_num_features if col not in ['User-ID', 'user_id', 'index']]
         
-        if hasattr(self.trainer, 'book_num_cols'):
+        if hasattr(self.trainer, 'book_num_cols') and self.trainer.book_num_cols:
             self.book_num_features = self.trainer.book_num_cols
-        elif hasattr(self.trainer, 'book_numerical_cols'):
-            self.book_num_features = self.trainer.book_numerical_cols
+        elif hasattr(self.trainer, 'book_features') and self.trainer.book_features is not None:
+            self.book_num_features = self.trainer.book_features.select_dtypes(include=[np.number]).columns.tolist()
+            self.book_num_features = [col for col in self.book_num_features if col not in ['ISBN', 'index']]
         
-        if hasattr(self.trainer, 'user_cat_cols'):
-            self.user_cat_features = self.trainer.user_cat_cols
-        if hasattr(self.trainer, 'book_cat_cols'):
-            self.book_cat_features = self.trainer.book_cat_cols
-        
-        if not self.user_num_features and hasattr(self.trainer, 'user_features') and self.trainer.user_features is not None:
-            for col in self.trainer.user_features.columns:
-                if self.trainer.user_features[col].dtype in ['float64', 'int64']:
-                    self.user_num_features.append(col)
-            logger.info(f"Автоматически определены user признаки: {self.user_num_features}")
-        
-        if not self.book_num_features and hasattr(self.trainer, 'book_features') and self.trainer.book_features is not None:
-            for col in self.trainer.book_features.columns:
-                if self.trainer.book_features[col].dtype in ['float64', 'int64']:
-                    self.book_num_features.append(col)
-            logger.info(f"Автоматически определены book признаки: {self.book_num_features}")
-        
+        # Формируем имена признаков
         self.feature_names = (
             [f'user_{col}' for col in self.user_num_features] +
-            [f'book_{col}' for col in self.book_num_features] +
-            [f'user_cat_{col}' for col in self.user_cat_features] +
-            [f'book_cat_{col}' for col in self.book_cat_features]
+            [f'book_{col}' for col in self.book_num_features]
         )
         
-        logger.info(f"Определено {len(self.feature_names)} признаков для SHAP")
-    
+        print(f"✅ SHAP: Определено {len(self.feature_names)} признаков")
+        print(f"   User: {len(self.user_num_features)}")
+        print(f"   Book: {len(self.book_num_features)}")
+        if len(self.feature_names) > 0:
+            print(f"   Примеры: {self.feature_names[:5]}...")
+
     def _get_default_background_pairs(self, n_users: int = 20, n_books_per_user: int = 5) -> List[Tuple[int, str]]:
         """Получает дефолтные пары для инициализации"""
         pairs = []
@@ -427,13 +416,15 @@ class SHAPAnalyzer:
         
         for book_id, score in recommendations[:5]:
             explanation = self.explain_prediction(user_id, book_id, nsamples, save_plot=False)
+
+            self.diagnose_feature_mapping(user_id, book_id)
             
             if 'error' not in explanation:
                 results.append({
                     'book_id': book_id,
                     'score': score,
-                    'top_positive': explanation['top_positive'][:3],
-                    'top_negative': explanation['top_negative'][:3]
+                    'top_positive': explanation['top_positive'],
+                    'top_negative': explanation['top_negative']
                 })
         
         plot_path = None
@@ -498,3 +489,83 @@ class SHAPAnalyzer:
             descriptions[f'book_{col}'] = f'Признак книги: {col}'
         
         return descriptions
+    
+    def diagnose_feature_mapping(self, user_id: int, book_id: str):
+        """
+        Диагностика: что реально попадает в SHAP
+        """
+        print("=" * 60)
+        print("ДИАГНОСТИКА SHAP ANALYZER")
+        print("=" * 60)
+        
+        # 1. Какие признаки определены
+        print(f"\n1. ОПРЕДЕЛЕННЫЕ ПРИЗНАКИ:")
+        print(f"   User numerical: {self.user_num_features}")
+        print(f"   Book numerical: {self.book_num_features}")
+        print(f"   Всего признаков в SHAP: {len(self.feature_names)}")
+        
+        # 2. Проверяем trainer
+        print(f"\n2. ДАННЫЕ В TRAINER:")
+        print(f"   trainer.user_features exists: {hasattr(self.trainer, 'user_features') and self.trainer.user_features is not None}")
+        print(f"   trainer.book_features exists: {hasattr(self.trainer, 'book_features') and self.trainer.book_features is not None}")
+        
+        if hasattr(self.trainer, 'user_features') and self.trainer.user_features is not None:
+            print(f"   user_features shape: {self.trainer.user_features.shape}")
+            print(f"   user_features columns: {list(self.trainer.user_features.columns)[:10]}")
+        
+        if hasattr(self.trainer, 'book_features') and self.trainer.book_features is not None:
+            print(f"   book_features shape: {self.trainer.book_features.shape}")
+            print(f"   book_features columns: {list(self.trainer.book_features.columns)[:10]}")
+        
+        # 3. Пробуем построить вектор для конкретной пары
+        print(f"\n3. ПОСТРОЕНИЕ ВЕКТОРА ДЛЯ user={user_id}, book={book_id}:")
+        vec = self._build_feature_vector(user_id, book_id)
+        
+        if vec is not None:
+            print(f"   Вектор построен, размерность: {len(vec)}")
+            print(f"   Не нулевых признаков: {np.sum(vec != 0)}")
+            print(f"   Первые 10 значений: {vec[:10]}")
+            
+            # Сравниваем с ожидаемой размерностью
+            expected_len = len(self.user_num_features) + len(self.book_num_features)
+            print(f"   Ожидаемая размерность: {expected_len}")
+            
+            if len(vec) != expected_len:
+                print(f"   ❌ РАЗМЕРНОСТЬ НЕ СОВПАДАЕТ!")
+        else:
+            print(f"   ❌ Не удалось построить вектор")
+        
+        # 4. Проверяем, какие признаки реально используются в модели
+        print(f"\n4. МОДЕЛЬ AFM:")
+        if hasattr(self.model, 'user_embedding'):
+            print(f"   user_embedding size: {self.model.user_embedding.num_embeddings} x {self.model.user_embedding.embedding_dim}")
+        if hasattr(self.model, 'book_embedding'):
+            print(f"   book_embedding size: {self.model.book_embedding.num_embeddings} x {self.model.book_embedding.embedding_dim}")
+        
+        # 5. Проверяем, какие фичи реально передаются в модель при forward_single
+        print(f"\n5. ПРОВЕРКА forward_single:")
+        try:
+            # Получаем индексы
+            user_idx = self.trainer.user_encoder.transform([user_id])[0] if hasattr(self.trainer, 'user_encoder') else 0
+            book_idx = self.trainer.book_encoder.transform([book_id])[0] if hasattr(self.trainer, 'book_encoder') else 0
+            
+            # Строим тензоры
+            user_num = torch.tensor(vec[:len(self.user_num_features)], dtype=torch.float32).unsqueeze(0) if len(self.user_num_features) > 0 else None
+            book_num = torch.tensor(vec[len(self.user_num_features):], dtype=torch.float32).unsqueeze(0) if len(self.book_num_features) > 0 else None
+            
+            print(f"   user_idx: {user_idx}, book_idx: {book_idx}")
+            print(f"   user_num shape: {user_num.shape if user_num is not None else None}")
+            print(f"   book_num shape: {book_num.shape if book_num is not None else None}")
+            
+            # Предсказание
+            with torch.no_grad():
+                score = self.model.forward_single(
+                    torch.tensor([user_idx]), 
+                    torch.tensor([book_idx]),
+                    user_num, book_num
+                )
+            print(f"   ✅ Предсказание успешно: {score.item():.4f}")
+        except Exception as e:
+            print(f"   ❌ Ошибка: {e}")
+        
+        return vec
