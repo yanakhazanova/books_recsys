@@ -1,11 +1,15 @@
+import asyncio
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from app.core.schemas import (
     PrepareDataResponse, TrainResponse, MetricsResponse,
     GlobalShapResponse, UserRecsResponse
 )
 from app.services.data_pipeline import DataLoader, DataAnalyzer
 from app.services.train_model import (
-    TrainTestSplitter, CollaborativeGenerator, 
+    TrainTestSplitter, CollaborativeGenerator,
     FeaturePipeline, AFMTrainer
 )
 from app.services.metrics_calculation import MetricsCalculator
@@ -14,11 +18,59 @@ from app.state import data_cache
 import app.state as state
 
 from app.services.shap_analyzer import SHAPAnalyzer
+from app.services.log_capture import get_log_path
+from app.services.llm_explainer import (
+    explain_recommendations as llm_explain_recommendations,
+    LLMConfigError,
+    DEFAULT_MODEL as LLM_DEFAULT_MODEL,
+)
 import random
 
 from typing import Optional
 
 router = APIRouter(prefix="/api/v1", tags=["recommendations"])
+
+
+# --- ISBN -> [genres] lookup, lazily loaded once from the source pkl ---
+_BOOK_GENRES_DICT = None
+_GENRE_PKL_PATH = Path("data/raw/Books_with_genre_features.pkl")
+
+
+def _get_book_genres_dict() -> dict:
+    """ISBN(uppercased) -> list[str] of genre strings, built once from the
+    same pkl that feeds add_genre_features. ~3 MB in memory.
+    """
+    global _BOOK_GENRES_DICT
+    if _BOOK_GENRES_DICT is not None:
+        return _BOOK_GENRES_DICT
+    if not _GENRE_PKL_PATH.exists():
+        _BOOK_GENRES_DICT = {}
+        return _BOOK_GENRES_DICT
+    try:
+        import pandas as _pd
+        print(f"📚 Загружаю genre lookup из {_GENRE_PKL_PATH}...")
+        df = _pd.read_pickle(_GENRE_PKL_PATH)
+        if 'isbn_10' not in df.columns or 'genres' not in df.columns:
+            print("   В пкл нет колонок isbn_10/genres — пропускаю")
+            _BOOK_GENRES_DICT = {}
+            return _BOOK_GENRES_DICT
+        d = {}
+        for isbns, genres in zip(df['isbn_10'], df['genres']):
+            if not isinstance(genres, (list, tuple)) or not genres:
+                continue
+            gl = [str(g) for g in genres]
+            if isinstance(isbns, (list, tuple)):
+                for isbn in isbns:
+                    if isbn:
+                        d[str(isbn).upper().strip()] = gl
+            elif isbns:
+                d[str(isbns).upper().strip()] = gl
+        _BOOK_GENRES_DICT = d
+        print(f"   ✅ Genre lookup: {len(d):,} ISBN → genres")
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить genre lookup: {e}")
+        _BOOK_GENRES_DICT = {}
+    return _BOOK_GENRES_DICT
 
 
 @router.post("/prepare", response_model=PrepareDataResponse)
@@ -27,7 +79,8 @@ async def prepare_data():
     try:
         loader = DataLoader()
         result = loader.run_preparation()
-        
+        data_cache.save_cleaned_data(loader.ratings, loader.books, loader.users)
+
         # Обновляем состояние
         state.books_df = loader.books
         if 'ISBN' in state.books_df.columns and 'Title' in state.books_df.columns:
@@ -125,9 +178,12 @@ async def generate_candidates(
 
 
 @router.post("/features", response_model=TrainResponse)
-async def create_features():
+async def create_features(
+      use_genre_features: bool = Query(True, description="Использовать жанровые эмбеддинги"),
+      use_word2vec: bool = Query(True, description="Word2vec эмбеддинги жанров"),
+      use_tfidf: bool = Query(False, description="TF-IDF эмбеддинги жанров"),
+):
     """Формирование фичей и триплетов"""
-    
     try:
         # Загружаем необходимые данные
         if state.train_ratings is None:
@@ -145,9 +201,12 @@ async def create_features():
         # Формируем фичи и триплеты
         feature_pipeline = FeaturePipeline()
         state.book_features, state.user_features, state.triplets = feature_pipeline.generate_features_and_triplets(
-            train_ratings=state.train_ratings,
-            books=books,
-            users=users
+              train_ratings=state.train_ratings,
+              books=books,
+              users=users,
+              use_genre_features=use_genre_features,
+              use_word2vec=use_word2vec,
+              use_tfidf=use_tfidf,
         )
         
         # Сохраняем
@@ -160,7 +219,7 @@ async def create_features():
             cv_score=None
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/train", response_model=TrainResponse)
@@ -266,6 +325,47 @@ async def continue_training(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     
+def _run_train_full_sync(test_items_per_user, n_candidates, use_existing_model,
+                          epochs, batch_size, embed_dim, attention_dim,
+                          learning_rate, skip_if_exists,
+                          use_genre_features, use_word2vec, use_tfidf):
+    """
+    Запускает все стадии конвейера синхронно в отдельном event loop.
+    Используется через asyncio.to_thread из train_full_pipeline, чтобы основной
+    event loop оставался свободным для /logs/stream и других запросов.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        if not skip_if_exists or not data_cache.check_cleaned_data():
+            loop.run_until_complete(prepare_data())
+        if not skip_if_exists or not data_cache.check_split():
+            loop.run_until_complete(
+                split_train_test(test_items_per_user=test_items_per_user))
+        if not skip_if_exists or not data_cache.check_candidates():
+            loop.run_until_complete(
+                generate_candidates(n_candidates=n_candidates))
+        if not skip_if_exists or not data_cache.check_features():
+              loop.run_until_complete(create_features(
+                  use_genre_features=use_genre_features,
+                  use_word2vec=use_word2vec,
+                  use_tfidf=use_tfidf,
+              ))
+        return loop.run_until_complete(train_model(
+            use_existing_model=use_existing_model,
+            epochs=epochs,
+            batch_size=batch_size,
+            embed_dim=embed_dim,
+            attention_dim=attention_dim,
+            learning_rate=learning_rate,
+        ))
+    finally:
+        try:
+            loop.close()
+        finally:
+            asyncio.set_event_loop(None)
+
+
 @router.post("/train_full", response_model=TrainResponse)
 async def train_full_pipeline(
     test_items_per_user: int = Query(2, description="Сколько книг на пользователя в тесте"),
@@ -276,40 +376,24 @@ async def train_full_pipeline(
     embed_dim: int = Query(64, ge=16, le=256, description="Размерность эмбеддингов"),
     attention_dim: int = Query(32, ge=8, le=128, description="Размерность attention слоя"),
     learning_rate: float = Query(0.001, ge=0.0001, le=0.1, description="Скорость обучения"),
-    skip_if_exists: bool = Query(False, description="Пропускать готовые этапы")
-):
+    skip_if_exists: bool = Query(False, description="Пропускать готовые этапы"),
+    use_genre_features: bool = Query(True, description="Использовать жанровые эмбеддинги"),
+    use_word2vec: bool = Query(True, description="Word2vec эмбеддинги жанров"),
+    use_tfidf: bool = Query(False, description="TF-IDF эмбеддинги жанров"),
+  ):
     """
-    Полный пайплайн обучения одной командой
+    Полный пайплайн обучения одной командой.
+    Тяжёлая работа уходит в отдельный поток, поэтому /logs/stream и другие
+    эндпойнты продолжают отвечать пока модель обучается.
     """
     try:
-        # Этап 1: Подготовка данных
-        if not skip_if_exists or not data_cache.check_cleaned_data():
-            await prepare_data()
-        
-        # Этап 2: Разделение
-        if not skip_if_exists or not data_cache.check_split():
-            await split_train_test(test_items_per_user=test_items_per_user)
-        
-        # Этап 3: Генерация кандидатов
-        if not skip_if_exists or not data_cache.check_candidates():
-            await generate_candidates(n_candidates=n_candidates)
-        
-        # Этап 4: Формирование фичей
-        if not skip_if_exists or not data_cache.check_features():
-            await create_features()
-        
-        # Этап 5: Обучение модели
-        result = await train_model(
-            use_existing_model=use_existing_model,
-            epochs=epochs,
-            batch_size=batch_size,
-            embed_dim=embed_dim,
-            attention_dim=attention_dim,
-            learning_rate=learning_rate
-        )
-        
-        return result
-        
+        return await asyncio.to_thread(
+              _run_train_full_sync,
+              test_items_per_user, n_candidates, use_existing_model,
+              epochs, batch_size, embed_dim, attention_dim, learning_rate,
+              skip_if_exists,
+              use_genre_features, use_word2vec, use_tfidf,
+          )
     except HTTPException:
         raise
     except Exception as e:
@@ -489,9 +573,6 @@ def _get_next_steps(data_ready, split_ready, candidates_ready, features_ready, m
            f"   - GET /api/v1/recommend/{{user_id}}?n_recs=10 для получения рекомендаций\n" \
            f"   - GET /api/v1/metrics?k=10&sample_users=100 для оценки качества\n" \
            f"   - POST /api/v1/shap/initialize для SHAP интерпретации"
-
-
-# app/api/endpoints.py - исправленные эндпоинты
 
 @router.get("/shap/global")
 async def get_global_shap(
@@ -738,12 +819,15 @@ async def explain_user_recommendations(
             save_plot=save_plot
         )
         
-        # Добавляем названия книг
+        # Добавляем названия книг + жанры (для человекочитаемого декодинга)
+        genres_lookup = _get_book_genres_dict()
         for rec in result['recommendations']:
+            book_id_str = str(rec['book_id'])
             book_title = None
             if state.books_titles_dict:
-                book_title = state.books_titles_dict.get(str(rec['book_id']))
+                book_title = state.books_titles_dict.get(book_id_str)
             rec['book_title'] = book_title
+            rec['genres'] = genres_lookup.get(book_id_str.upper().strip(), [])
         
         return {
             'status': 'success',
@@ -759,3 +843,214 @@ async def explain_user_recommendations(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+#  LLM-powered explanations (OpenRouter)
+# ============================================================
+
+def _build_user_profile(user_id: int) -> dict:
+    """Собрать профиль пользователя из state.train_ratings + genre lookup."""
+    profile = {}
+    tr = state.train_ratings
+    if tr is None:
+        return profile
+    user_rows = tr[tr['User-ID'] == user_id]
+    if not len(user_rows):
+        return profile
+    nonzero = user_rows[user_rows['Rating'] > 0]
+    profile['rating_count'] = int(len(user_rows))
+    profile['non_zero_ratio'] = float(len(nonzero) / max(len(user_rows), 1))
+    if len(nonzero):
+        profile['avg_rating'] = float(nonzero['Rating'].mean())
+
+    # Топ-жанры, которые этот пользователь читал (из его train-ISBN)
+    genres_lookup = _get_book_genres_dict()
+    if genres_lookup:
+        from collections import Counter
+        counter: Counter = Counter()
+        for isbn in user_rows['ISBN'].astype(str).str.upper().str.strip().tolist():
+            for g in genres_lookup.get(isbn, []):
+                counter[g] += 1
+        if counter:
+            profile['top_genres'] = [g for g, _ in counter.most_common(8)]
+    return profile
+
+
+@router.post("/explain/llm/{user_id}")
+async def explain_with_llm(
+    user_id: int,
+    n_recs: int = Query(5, ge=1, le=10, description="Сколько рекомендаций объяснять"),
+    nsamples: int = Query(30, ge=10, le=80, description="SHAP-сэмплов на рекомендацию"),
+    model: str = Query(LLM_DEFAULT_MODEL, description="OpenRouter model slug"),
+):
+    """
+    Запрашивает у LLM (через OpenRouter) человекочитаемые объяснения
+    того, почему модель порекомендовала эти книги. Возвращает текст
+    на каждую книгу. Требует OPENROUTER_API_KEY в env.
+    """
+    # Reuse the SHAP explanation path
+    if state.model is None:
+        raise HTTPException(status_code=400, detail="Модель не загружена. Сначала /train")
+    if state.user_features is None or state.book_features is None:
+        raise HTTPException(status_code=400, detail="Фичи не загружены. Сначала /features")
+    if state.candidates is None:
+        state.candidates = data_cache.load_candidates()
+        if state.candidates is None:
+            raise HTTPException(status_code=400, detail="Нет кандидатов. Сначала /candidates")
+    if user_id not in state.candidates:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Пользователь {user_id} не найден в кандидатах "
+                    f"(после очистки осталось {len(state.candidates)} пользователей)."
+        )
+
+    if state.shap_analyzer is None:
+        if state.model.user_features is None:
+            state.model.user_features = state.user_features
+        if state.model.book_features is None:
+            state.model.book_features = state.book_features
+        state.shap_analyzer = SHAPAnalyzer(
+            model=state.model.model,
+            trainer=state.model,
+            device=state.model.device,
+            save_dir="models/shap",
+        )
+
+    try:
+        candidate_books = list(state.candidates[user_id].keys())
+        ranked = state.model.predict_for_user(user_id, candidate_books, top_n=n_recs)
+        if not ranked:
+            return {"status": "success", "user_id": user_id,
+                    "recommendations": [], "model": model}
+
+        shap_result = state.shap_analyzer.explain_user_recommendations(
+            user_id=user_id, recommendations=ranked, nsamples=nsamples,
+            save_plot=False,
+        )
+
+        # Enrich recommendations with titles + genres (same as /shap/explain/recommendations)
+        genres_lookup = _get_book_genres_dict()
+        recs = shap_result.get('recommendations', [])
+        for rec in recs:
+            book_id_str = str(rec['book_id'])
+            if state.books_titles_dict:
+                rec['book_title'] = state.books_titles_dict.get(book_id_str)
+            rec['genres'] = genres_lookup.get(book_id_str.upper().strip(), [])
+
+        user_profile = _build_user_profile(user_id)
+
+        # Call OpenRouter
+        llm_result = await llm_explain_recommendations(
+            user_profile=user_profile,
+            recommendations=recs,
+            model=model,
+        )
+        explanations = llm_result.get('explanations', {})
+
+        for rec in recs:
+            bid = str(rec['book_id'])
+            rec['llm_explanation'] = (
+                explanations.get(bid)
+                or explanations.get('_global')
+                or ''
+            )
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "user_profile": user_profile,
+            "model": llm_result.get('model', model),
+            "tokens": llm_result.get('tokens', {}),
+            "recommendations": recs,
+        }
+
+    except LLMConfigError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ LLM explain failed: {e}")
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+#  Live server logs (Server-Sent Events)
+# ============================================================
+
+def _sse(line: str) -> str:
+    """Один блок SSE (data: ...). Многострочный текст разбивается на data: lines."""
+    safe = line.replace('\r', '')
+    parts = [f"data: {chunk}" for chunk in safe.split('\n')]
+    return "\n".join(parts) + "\n\n"
+
+
+@router.get("/logs/stream")
+async def stream_logs(
+    tail: int = Query(300, ge=0, le=2000,
+                       description="Сколько последних строк отдать при подключении"),
+):
+    """
+    Стрим логов сервера через Server-Sent Events. Сначала отдаёт последние
+    `tail` строк, потом подписывается на новые записи в файле и отдаёт их
+    как только они появляются.
+    """
+    log_path = get_log_path()
+    if log_path is None or not log_path.exists():
+        raise HTTPException(status_code=503, detail="Log capture не включён")
+
+    async def gen():
+        # ---- начальный хвост ----
+        try:
+            with open(log_path, 'rb') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                read_back = min(size, 256 * 1024)  # не больше 256 KB при первом чтении
+                f.seek(size - read_back)
+                buf = f.read(read_back).decode('utf-8', errors='replace')
+            if size > read_back:
+                # отрезаем возможную обрезанную первую строку
+                nl = buf.find('\n')
+                if nl != -1:
+                    buf = buf[nl + 1:]
+            lines = buf.splitlines()[-tail:] if tail else []
+            for line in lines:
+                yield _sse(line)
+        except FileNotFoundError:
+            yield _sse("[лог-файл ещё не создан]")
+            return
+
+        # ---- ожидание новых строк ----
+        # Открываем файл повторно и сидим в конце. На каждой итерации даём
+        # шанс циклу выйти из ожидания (cancellation/client disconnect).
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(0, 2)
+                idle = 0
+                while True:
+                    line = f.readline()
+                    if line:
+                        yield _sse(line.rstrip('\n'))
+                        idle = 0
+                    else:
+                        await asyncio.sleep(0.4)
+                        idle += 1
+                        # heartbeat каждые ~8s, чтобы прокси не убил соединение
+                        if idle >= 20:
+                            yield ": keep-alive\n\n"
+                            idle = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            yield _sse(f"[stream error: {e}]")
+
+    return StreamingResponse(
+        gen(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )

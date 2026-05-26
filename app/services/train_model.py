@@ -196,7 +196,11 @@ class FeaturePipeline:
     def generate_features_and_triplets(self, 
                                        train_ratings: pd.DataFrame,
                                        books: pd.DataFrame,
-                                       users: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                                       users: pd.DataFrame,
+                                       use_genre_features: bool = True,
+                                       genre_pkl_path: str = "data/raw/Books_with_genre_features.pkl",
+                                       use_word2vec: bool = True,
+                                       use_tfidf: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Формирование фичей и триплетов только на тренировочных данных
         
@@ -220,10 +224,22 @@ class FeaturePipeline:
         # 2. Добавляем статистики из тренировочных рейтингов
         print("\n📊 Шаг 2: Добавление статистик из рейтингов...")
         self.book_features, _ = self.book_fe.add_rating_statistics(
-            book_content_features, 
-            train_ratings,  # Только тренировочные!
-            fit_scaler=True
-        )
+        book_content_features,
+        train_ratings,  # Только тренировочные!
+        fit_scaler=True
+    )
+
+        # 2b. Жанровые эмбеддинги (опционально)
+        if use_genre_features:
+            print("\n🎭 Шаг 2b: Жанровые эмбеддинги...")
+            self.book_features = self.book_fe.add_genre_features(
+                self.book_features,
+                genre_pkl_path=genre_pkl_path,
+                use_word2vec=use_word2vec,
+                use_tfidf=use_tfidf,
+            )
+        else:
+            print("\n🎭 Шаг 2b: Жанровые эмбеддинги пропущены (use_genre_features=False)")
         
         # 3. Фичи пользователей (только из тренировочных)
         print("\n👤 Шаг 3: Фичи пользователей...")

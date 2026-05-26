@@ -206,15 +206,33 @@ class SHAPAnalyzer:
                 book_num.append(float(val))
             else:
                 book_num.append(0.0)
-        
-        vector = user_num + book_num
-        
-        if len(vector) == 0:
+
+        # ВАЖНО: применяем StandardScaler точно так же, как это делает
+        # AFMDataset.__getitem__ при обучении. Иначе модель видит сырые
+        # значения (e.g. publisher_book_count=2871), интерпретирует их как
+        # z-score и выдаёт абсурдные предсказания → SHAP-значения в сотни.
+        user_num_arr = np.asarray(user_num, dtype=np.float32).reshape(1, -1)
+        book_num_arr = np.asarray(book_num, dtype=np.float32).reshape(1, -1)
+        if (getattr(self.trainer, 'user_scaler', None) is not None
+                and user_num_arr.size > 0):
+            try:
+                user_num_arr = self.trainer.user_scaler.transform(user_num_arr)
+            except Exception as e:
+                logger.warning(f"user_scaler.transform не сработал, использую сырые значения: {e}")
+        if (getattr(self.trainer, 'book_scaler', None) is not None
+                and book_num_arr.size > 0):
+            try:
+                book_num_arr = self.trainer.book_scaler.transform(book_num_arr)
+            except Exception as e:
+                logger.warning(f"book_scaler.transform не сработал, использую сырые значения: {e}")
+
+        vector = np.concatenate([user_num_arr.flatten(), book_num_arr.flatten()])
+
+        if vector.size == 0:
             print(f"   ❌ Пустой вектор для user={user_id}, book={book_id_str}")
             return None
-        
         # print(f"   ✅ Вектор построен: {len(vector)} признаков")
-        return np.array(vector, dtype=np.float32)
+        return vector.astype(np.float32)
 
     def _predict_fn(self, x: np.ndarray) -> np.ndarray:
         """Функция предсказания для SHAP"""
@@ -243,10 +261,58 @@ class SHAPAnalyzer:
         
         return np.array(predictions)
     
-    def get_global_importance(self, test_pairs: List[Tuple[int, str]], 
+    @staticmethod
+    def _aggregate_shap_array(names: List[str], matrix: np.ndarray,
+                               aggregate: bool = True) -> Tuple[List[str], np.ndarray]:
+        """
+        Объединяет 64 столбца `genre_emb_*` (и `genre_tfidf_emb_*`) в один
+        столбец signed-sum. SHAP — аддитивная мера (efficiency axiom):
+        сумма phi_i по группе = вклад группы в (f(x) - E[f(X)]).
+        Поэтому такая склейка строго эквивалентна "вкладу группы" и не
+        теряет информации.
+
+        Args:
+            names:  список имён фичей длины M
+            matrix: SHAP-массив формы (n_samples, M)  или (M,)
+            aggregate: если False — no-op (возвращает копию)
+        Returns: (new_names, new_matrix), где M уменьшается.
+        """
+        if not aggregate:
+            return list(names), np.array(matrix, copy=True)
+
+        m = np.atleast_2d(np.asarray(matrix, dtype=np.float32))
+
+        keep_idx, w2v_idx, tfidf_idx = [], [], []
+        for j, name in enumerate(names):
+            parts = name.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                stem = parts[0]
+                if stem.endswith('genre_tfidf_emb'):
+                    tfidf_idx.append(j); continue
+                if stem.endswith('genre_emb'):
+                    w2v_idx.append(j); continue
+            keep_idx.append(j)
+
+        new_names = [names[j] for j in keep_idx]
+        chunks = [m[:, keep_idx]] if keep_idx else []
+        if w2v_idx:
+            new_names.append('book_genre_w2v_total')
+            chunks.append(m[:, w2v_idx].sum(axis=1, keepdims=True))
+        if tfidf_idx:
+            new_names.append('book_genre_tfidf_total')
+            chunks.append(m[:, tfidf_idx].sum(axis=1, keepdims=True))
+
+        new_matrix = np.concatenate(chunks, axis=1) if chunks else m
+        # Squeeze back if input was 1D
+        if matrix.ndim == 1:
+            new_matrix = new_matrix[0]
+        return new_names, new_matrix
+
+    def get_global_importance(self, test_pairs: List[Tuple[int, str]],
                               nsamples_per_pair: int = 50,
                               max_pairs: int = 100,
-                              save_plot: bool = True) -> Dict:
+                              save_plot: bool = True,
+                              aggregate_groups: bool = True) -> Dict:
         """
         Вычисляет глобальную важность признаков и сохраняет график
         """
@@ -288,13 +354,19 @@ class SHAPAnalyzer:
             return {'status': 'error', 'message': 'Не удалось вычислить SHAP значения'}
         
         shap_matrix = np.array(all_shap_values)
-        
+
+        # Сворачиваем 64 жанровых эмбеддинга в один столбец genre_w2v_total.
+        # SHAP-аддитивность гарантирует: signed sum по группе = вклад группы.
+        agg_names, shap_matrix = self._aggregate_shap_array(
+            self.feature_names, shap_matrix, aggregate=aggregate_groups
+        )
+
         mean_abs_shap = np.abs(shap_matrix).mean(axis=0)
         mean_shap = shap_matrix.mean(axis=0)
         std_shap = shap_matrix.std(axis=0)
-        
+
         importance_df = pd.DataFrame({
-            'feature': self.feature_names,
+            'feature': agg_names,
             'mean_abs_shap': mean_abs_shap,
             'mean_shap': mean_shap,
             'std_shap': std_shap
@@ -332,7 +404,8 @@ class SHAPAnalyzer:
         logger.info(f"График сохранен: {plot_path}")
         return str(plot_path)
     
-    def explain_prediction(self, user_id: int, book_id: str, nsamples: int = 100, save_plot: bool = True) -> Dict:
+    def explain_prediction(self, user_id: int, book_id: str, nsamples: int = 100,
+                            save_plot: bool = True, aggregate_groups: bool = True) -> Dict:
         """
         Объясняет предсказание для конкретной пары и сохраняет график
         """
@@ -353,9 +426,13 @@ class SHAPAnalyzer:
             else:
                 shap_1d = shap_values[0]
             
+            # Сворачиваем эмбеддинговые группы (см. SHAP additivity proof)
+            agg_names, agg_vals = self._aggregate_shap_array(
+                self.feature_names, shap_1d, aggregate=aggregate_groups
+            )
             explanation = {
-                self.feature_names[i]: float(shap_1d[i]) 
-                for i in range(len(self.feature_names))
+                agg_names[i]: float(agg_vals[i])
+                for i in range(len(agg_names))
             }
             
             score = self._predict_fn(feature_vector.reshape(1, -1))[0]

@@ -240,6 +240,61 @@ class BookFeatureEngineer:
         
         return book_features, self.scaler
 
+    def add_genre_features(self,
+                            book_features: pd.DataFrame,
+                            genre_pkl_path: str = "data/raw/Books_with_genre_features.pkl",
+                            use_word2vec: bool = True,
+                            use_tfidf: bool = False) -> pd.DataFrame:
+        """
+        Merges precomputed genre embeddings into book_features.
+        Source pkl is keyed by `isbn_10`; we rename to `ISBN` and left-join.
+        Missing books get zero-filled embedding rows.
+        """
+        genre_df = pd.read_pickle(genre_pkl_path)
+
+        # Pick which embedding columns to keep
+        keep_cols = ['isbn_10', 'num_genres']
+        if use_word2vec:
+            keep_cols += [c for c in genre_df.columns if c.startswith('genre_emb_')]
+        if use_tfidf:
+            keep_cols += [c for c in genre_df.columns if c.startswith('genre_tfidf_emb_')]
+
+        genre_df = genre_df[keep_cols].copy()
+
+        def _first_isbn(v):
+            if isinstance(v, (list, tuple)):
+                return v[0] if len(v) > 0 else None
+            return v
+
+        genre_df['isbn_10'] = genre_df['isbn_10'].apply(_first_isbn)
+        genre_df = genre_df.dropna(subset=['isbn_10'])
+        genre_df = genre_df.rename(columns={'isbn_10': 'ISBN'})
+        genre_df['ISBN'] = genre_df['ISBN'].astype(str).str.upper().str.strip()
+        genre_df = genre_df.drop_duplicates(subset='ISBN', keep='first').set_index('ISBN')
+
+        # Left-join on book_features index (which is ISBN)
+        book_features = book_features.copy()
+
+        # Ensure ISBN is the index (after merge() upstream it may be a column)
+        if 'ISBN' in book_features.columns:
+            book_features['ISBN'] = book_features['ISBN'].astype(str).str.upper().str.strip()
+            book_features = book_features.set_index('ISBN')
+        else:
+            book_features.index = book_features.index.astype(str).str.upper().str.strip()
+            book_features.index.name = 'ISBN'
+        book_features = book_features.loc[~book_features.index.duplicated(keep='first')]
+        merged = book_features.join(genre_df, how='left')
+
+        # Fill missing embeddings with 0
+        embed_cols = [c for c in merged.columns
+                        if c.startswith('genre_emb_') or c.startswith('genre_tfidf_emb_')
+                        or c == 'num_genres']
+        merged[embed_cols] = merged[embed_cols].fillna(0)
+        merged = merged.loc[~merged.index.duplicated(keep='first')]
+        print(f"✅ Добавлено {len(embed_cols)} жанровых фичей; "
+                f"книг с эмбеддингами: {genre_df.index.isin(merged.index).sum()}")
+        return merged
+
 
 class UserFeatureEngineer:
     """Инжиниринг фичей для пользователей (без утечек)"""

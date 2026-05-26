@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book RecSys · Control Panel</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">📚</span>
+    <div>
+      <div class="brand-title">Book RecSys</div>
+      <div class="brand-sub">AFM model · control panel</div>
+    </div>
+  </div>
+  <div class="status-chip" id="apiStatus">
+    <span class="dot"></span>
+    <span class="label">checking…</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="train">
+    <span class="tab-num">01</span>
+    <span class="tab-name">Train pipeline</span>
+  </button>
+  <button class="tab" data-tab="global">
+    <span class="tab-num">02</span>
+    <span class="tab-name">Global SHAP</span>
+  </button>
+  <button class="tab" data-tab="user">
+    <span class="tab-num">03</span>
+    <span class="tab-name">User explanations</span>
+  </button>
+</nav>
+
+<main class="content">
+
+  <!-- =================== TRAIN_FULL =================== -->
+  <section class="panel" id="panel-train">
+    <div class="panel-head">
+      <h2>Full training pipeline</h2>
+      <p>Запускает все 5 этапов одной командой: prepare → split → candidates → features → train.
+         Использует кэш если установлен <code>skip_if_exists</code>.</p>
+    </div>
+
+    <form id="trainForm" class="grid grid-3">
+      <label class="field">
+        <span class="field-label">test_items_per_user</span>
+        <input type="number" name="test_items_per_user" value="2" min="1" max="20">
+        <span class="field-hint">Сколько книг на пользователя в тесте</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">n_candidates</span>
+        <input type="number" name="n_candidates" value="1000" min="10" max="10000" step="10">
+        <span class="field-hint">Кандидатов на пользователя</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">epochs</span>
+        <input type="number" name="epochs" value="10" min="1" max="100">
+        <span class="field-hint">Эпох обучения</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">batch_size</span>
+        <input type="number" name="batch_size" value="512" min="16" max="10000" step="16">
+        <span class="field-hint">Размер батча</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">embed_dim</span>
+        <input type="number" name="embed_dim" value="64" min="16" max="256" step="8">
+        <span class="field-hint">Размерность эмбеддингов</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">attention_dim</span>
+        <input type="number" name="attention_dim" value="32" min="8" max="128" step="4">
+        <span class="field-hint">Размерность attention</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">learning_rate</span>
+        <input type="number" name="learning_rate" value="0.001" min="0.0001" max="0.1" step="0.0001">
+        <span class="field-hint">Скорость обучения</span>
+      </label>
+
+      <label class="field toggle">
+        <input type="checkbox" name="use_existing_model">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        <div>
+          <span class="field-label">use_existing_model</span>
+          <span class="field-hint">Загрузить сохранённую модель</span>
+        </div>
+      </label>
+
+      <label class="field toggle">
+        <input type="checkbox" name="skip_if_exists" checked>
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        <div>
+          <span class="field-label">skip_if_exists</span>
+          <span class="field-hint">Пропускать готовые этапы</span>
+        </div>
+      </label>
+
+      <div class="form-actions span-3">
+        <button type="submit" class="btn btn-primary" id="trainBtn">
+          <span class="btn-label">Запустить обучение</span>
+          <span class="btn-spinner" hidden></span>
+        </button>
+        <span class="warn">⚠ Эндпойнт синхронный — обучение займёт от минут до часов.</span>
+      </div>
+    </form>
+
+    <div class="result" id="trainResult" hidden>
+      <div class="result-head">
+        <span class="badge"></span>
+        <span class="result-title"></span>
+      </div>
+      <pre class="result-body"></pre>
+    </div>
+
+    <div class="log-panel" id="logPanel">
+      <div class="log-header">
+        <div class="log-title">
+          <span class="log-dot-wrap">
+            <span class="log-dot"></span>
+            <span class="log-state">disconnected</span>
+          </span>
+          <span class="log-name">📟 server logs</span>
+        </div>
+        <div class="log-controls">
+          <button type="button" class="log-btn" id="logConnBtn">Подключиться</button>
+          <button type="button" class="log-btn" id="logScrollBtn">Auto-scroll · on</button>
+          <button type="button" class="log-btn" id="logClearBtn">Очистить</button>
+        </div>
+      </div>
+      <div class="log-body" id="logBody"></div>
+    </div>
+  </section>
+
+  <!-- =================== GLOBAL SHAP =================== -->
+  <section class="panel" id="panel-global" hidden>
+    <div class="panel-head">
+      <h2>Global feature importance</h2>
+      <p>Берёт <code>n_pairs</code> случайных (user, book) пар и считает SHAP для каждой.
+         Возвращает топ-фичи по среднему <code>|SHAP|</code>.</p>
+    </div>
+
+    <form id="globalForm" class="grid grid-3">
+      <label class="field">
+        <span class="field-label">n_pairs</span>
+        <input type="number" name="n_pairs" value="20" min="5" max="100">
+        <span class="field-hint">Пар для анализа</span>
+      </label>
+      <label class="field">
+        <span class="field-label">nsamples_per_pair</span>
+        <input type="number" name="nsamples_per_pair" value="10" min="5" max="50">
+        <span class="field-hint">SHAP-семплов на пару</span>
+      </label>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary" id="globalBtn">
+          <span class="btn-label">Посчитать важность</span>
+          <span class="btn-spinner" hidden></span>
+        </button>
+      </div>
+    </form>
+
+    <div class="result" id="globalResult" hidden>
+      <div class="metrics-row" id="globalMetrics"></div>
+      <div class="chart-wrap">
+        <canvas id="globalChart"></canvas>
+      </div>
+      <details class="raw">
+        <summary>Сырые значения</summary>
+        <pre id="globalRaw"></pre>
+      </details>
+    </div>
+  </section>
+
+  <!-- =================== USER SHAP =================== -->
+  <section class="panel" id="panel-user" hidden>
+    <div class="panel-head">
+      <h2>Personal recommendation explanations</h2>
+      <p>Топ-N рекомендаций для пользователя и SHAP-разбор каждой: какие признаки толкнули рекомендацию вверх, какие вниз.</p>
+    </div>
+
+    <form id="userForm" class="grid grid-3">
+      <label class="field">
+        <span class="field-label">user_id</span>
+        <input type="number" name="user_id" placeholder="123" required>
+        <span class="field-hint">ID пользователя из train_ratings</span>
+      </label>
+      <label class="field">
+        <span class="field-label">n_recs</span>
+        <input type="number" name="n_recs" value="5" min="1" max="10">
+        <span class="field-hint">Сколько рекомендаций объяснить</span>
+      </label>
+      <label class="field">
+        <span class="field-label">nsamples</span>
+        <input type="number" name="nsamples" value="30" min="10" max="80">
+        <span class="field-hint">SHAP-семплов на рекомендацию</span>
+      </label>
+      <div class="form-actions span-3">
+        <button type="submit" class="btn btn-primary" id="userBtn">
+          <span class="btn-label">Объяснить рекомендации</span>
+          <span class="btn-spinner" hidden></span>
+        </button>
+      </div>
+    </form>
+
+    <div class="result" id="userResult" hidden>
+      <div class="user-summary" id="userSummary"></div>
+      <div class="recs-list" id="userRecs"></div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast-host" id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

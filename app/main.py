@@ -1,5 +1,13 @@
+from pathlib import Path
+
+# Install log capture BEFORE other imports so their prints are recorded too.
+from app.services.log_capture import install_log_capture
+LOG_FILE = install_log_capture()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from app.api.endpoints import router
 from app.services.train_model import AFMTrainer, DataCache
 from app.core.config import settings
@@ -25,6 +33,11 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+# Serve frontend
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.on_event("startup")
 async def startup_event():
@@ -82,6 +95,10 @@ async def startup_event():
 
 @app.get("/")
 async def root():
+    """Раздаёт frontend SPA, либо JSON если фронт не собран."""
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {
         "message": "Book Recommendation System API",
         "endpoints": [
