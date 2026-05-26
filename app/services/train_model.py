@@ -379,12 +379,27 @@ class AFMTrainer:
         self.book_features = None  # Будет установлен при предсказаниях
         self.user_clean_to_original = {}
         self.book_clean_to_original = {}
+        # Dict-based lookups (numpy 2.0 raises NotImplementedError on searchsorted
+        # for object-dtype arrays, so we avoid LabelEncoder.transform at inference)
+        self._user_to_idx: dict = {}
+        self._book_to_idx: dict = {}
         
         print(f"✅ AFMTrainer инициализирован с параметрами:")
         print(f"   embed_dim={embed_dim}, attention_dim={attention_dim}")
         print(f"   batch_size={batch_size}, epochs={epochs}, lr={learning_rate}")
         print(f"   device={self.device}")
     
+    def _build_encoder_dicts(self):
+        """Build O(1) lookup dicts from LabelEncoder classes.
+
+        Replaces direct numpy array operations (searchsorted / __contains__) that
+        raise NotImplementedError on object-dtype arrays in numpy 2.0+.
+        """
+        if self.user_encoder is not None:
+            self._user_to_idx = {cls: i for i, cls in enumerate(self.user_encoder.classes_.tolist())}
+        if self.book_encoder is not None:
+            self._book_to_idx = {cls: i for i, cls in enumerate(self.book_encoder.classes_.tolist())}
+
     def _get_categorical_value(self, features_df, col_name, default=0):
         """
         Безопасно получает значение категориальной фичи из DataFrame
@@ -761,7 +776,8 @@ class AFMTrainer:
         self.book_scaler = dataset.book_scaler
         self.user_num_cols = dataset.user_num_cols
         self.book_num_cols = dataset.book_num_cols
-        
+        self._build_encoder_dicts()
+
         return self
 
     def save(self, filepath: str = "models/afm_model.pth"):
@@ -842,7 +858,8 @@ class AFMTrainer:
         
         self.user_features = None
         self.book_features = None
-        
+        self._build_encoder_dicts()
+
         print(f"📂 Модель загружена из {filepath}")
         print(f"   Всего эпох: {len(self.train_losses)}")
         print(f"   Финальный loss: {self.train_losses[-1] if self.train_losses else 'N/A':.4f}")
@@ -861,11 +878,11 @@ class AFMTrainer:
         self.model.eval()
         
         # Проверяем, известен ли пользователь
-        if user_id not in self.user_encoder.classes_:
+        if user_id not in self._user_to_idx:
             print(f"⚠️ Пользователь {user_id} не известен модели")
             return []
-        
-        user_idx = self.user_encoder.transform([user_id])[0]
+
+        user_idx = self._user_to_idx[user_id]
         
         # Числовые фичи пользователя
         if user_id in self.user_features.index:
@@ -882,10 +899,10 @@ class AFMTrainer:
         valid_books = []
         
         for book_id in book_ids:
-            if book_id not in self.book_encoder.classes_:
+            if book_id not in self._book_to_idx:
                 continue
-            
-            book_idx = self.book_encoder.transform([book_id])[0]
+
+            book_idx = self._book_to_idx[book_id]
             
             # Числовые фичи книги
             if book_id in self.book_features.index:
@@ -947,7 +964,7 @@ class AFMTrainer:
         # Используем tqdm для прогресс-бара
         from tqdm import tqdm
         for user_id, candidate_books in tqdm(filtered_candidates.items(), desc="Ранжирование"):
-            if user_id not in self.user_encoder.classes_:
+            if user_id not in self._user_to_idx:
                 recommendations[user_id] = list(candidate_books.keys())[:top_n]
                 continue
             
@@ -986,9 +1003,14 @@ class DataCache:
         """Загружает очищенные данные"""
         if not self.cleaned_data_path.exists():
             return None, None, None
-        with open(self.cleaned_data_path, 'rb') as f:
-            data = pickle.load(f)
-        return data['ratings'], data['books'], data['users']
+        try:
+            with open(self.cleaned_data_path, 'rb') as f:
+                data = pickle.load(f)
+            return data['ratings'], data['books'], data['users']
+        except Exception as e:
+            print(f"⚠️ Кэш {self.cleaned_data_path} повреждён ({type(e).__name__}: {e}). Удаляю — запустите /prepare заново.")
+            self.cleaned_data_path.unlink(missing_ok=True)
+            return None, None, None
     
     def check_cleaned_data(self) -> bool:
         return self.cleaned_data_path.exists()
@@ -1003,9 +1025,14 @@ class DataCache:
         """Загружает разделенные данные"""
         if not self.split_path.exists():
             return None, None
-        with open(self.split_path, 'rb') as f:
-            data = pickle.load(f)
-        return data['train'], data['test']
+        try:
+            with open(self.split_path, 'rb') as f:
+                data = pickle.load(f)
+            return data['train'], data['test']
+        except Exception as e:
+            print(f"⚠️ Кэш {self.split_path} повреждён ({type(e).__name__}: {e}). Удаляю — запустите /split заново.")
+            self.split_path.unlink(missing_ok=True)
+            return None, None
     
     def check_split(self) -> bool:
         return self.split_path.exists()
@@ -1020,8 +1047,13 @@ class DataCache:
         """Загружает кандидатов"""
         if not self.candidates_path.exists():
             return None
-        with open(self.candidates_path, 'rb') as f:
-            return pickle.load(f)
+        try:
+            with open(self.candidates_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"⚠️ Кэш {self.candidates_path} повреждён ({type(e).__name__}: {e}). Удаляю — запустите /candidates заново.")
+            self.candidates_path.unlink(missing_ok=True)
+            return None
     
     def check_candidates(self) -> bool:
         return self.candidates_path.exists()
@@ -1036,9 +1068,14 @@ class DataCache:
         """Загружает фичи и триплеты"""
         if not self.features_path.exists():
             return None, None, None
-        with open(self.features_path, 'rb') as f:
-            data = pickle.load(f)
-        return data['book_features'], data['user_features'], data['triplets']
+        try:
+            with open(self.features_path, 'rb') as f:
+                data = pickle.load(f)
+            return data['book_features'], data['user_features'], data['triplets']
+        except Exception as e:
+            print(f"⚠️ Кэш {self.features_path} повреждён ({type(e).__name__}: {e}). Удаляю — запустите /features заново.")
+            self.features_path.unlink(missing_ok=True)
+            return None, None, None
     
     def check_features(self) -> bool:
         return self.features_path.exists()
@@ -1053,8 +1090,13 @@ class DataCache:
         """Загружает модель"""
         if not self.model_path.exists():
             return None
-        with open(self.model_path, 'rb') as f:
-            return pickle.load(f)
+        try:
+            with open(self.model_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"⚠️ Кэш {self.model_path} повреждён ({type(e).__name__}: {e}). Удаляю.")
+            self.model_path.unlink(missing_ok=True)
+            return None
     
     def check_model(self) -> bool:
         return self.model_path.exists()
