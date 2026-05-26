@@ -34,6 +34,12 @@ class SHAPAnalyzer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
+        # Контекст текущей объясняемой пары (user_idx, book_idx).
+        # _predict_fn читает эти поля, чтобы использовать правильные эмбеддинги.
+        # Дефолт 0 используется только для инициализации фонового распределения.
+        self._ctx_user_idx: int = 0
+        self._ctx_book_idx: int = 0
+
         # Определяем признаки
         self._define_features()
     
@@ -235,30 +241,36 @@ class SHAPAnalyzer:
         return vector.astype(np.float32)
 
     def _predict_fn(self, x: np.ndarray) -> np.ndarray:
-        """Функция предсказания для SHAP"""
+        """Функция предсказания для SHAP.
+
+        Использует self._ctx_user_idx / self._ctx_book_idx, которые
+        устанавливаются перед каждым вызовом shap_values() в explain_prediction.
+        Для глобального анализа оба остаются 0 (explain_value отражает
+        вклад числовых фичей относительно нейтрального ID-контекста).
+        """
         self.model.eval()
         predictions = []
-        
+
+        user_tensor = torch.tensor([self._ctx_user_idx], device=self.device)
+        book_tensor = torch.tensor([self._ctx_book_idx], device=self.device)
+
         with torch.no_grad():
             for i in range(x.shape[0]):
                 try:
                     n_user_num = len(self.user_num_features)
                     n_book_num = len(self.book_num_features)
-                    
+
                     user_num_arr = x[i, :n_user_num] if n_user_num > 0 else np.array([])
                     book_num_arr = x[i, n_user_num:n_user_num + n_book_num] if n_book_num > 0 else np.array([])
-                    
-                    user_tensor = torch.tensor([0], device=self.device)
-                    book_tensor = torch.tensor([0], device=self.device)
-                    
+
                     user_num = torch.tensor(user_num_arr, dtype=torch.float32, device=self.device).unsqueeze(0) if len(user_num_arr) > 0 else None
                     book_num = torch.tensor(book_num_arr, dtype=torch.float32, device=self.device).unsqueeze(0) if len(book_num_arr) > 0 else None
-                    
+
                     score = self.model.forward_single(user_tensor, book_tensor, user_num, book_num)
                     predictions.append(score.item())
                 except Exception as e:
                     predictions.append(0.0)
-        
+
         return np.array(predictions)
     
     @staticmethod
@@ -415,7 +427,12 @@ class SHAPAnalyzer:
         feature_vector = self._build_feature_vector(user_id, book_id)
         if feature_vector is None:
             return {'error': f'Не удалось построить вектор для user={user_id}, book={book_id}'}
-        
+
+        # Устанавливаем ID-контекст для _predict_fn: теперь SHAP объясняет
+        # вклад числовых фичей при правильных эмбеддингах этой пары.
+        self._ctx_user_idx = self.trainer._user_to_idx.get(user_id, 0)
+        self._ctx_book_idx = self.trainer._book_to_idx.get(str(book_id), 0)
+
         try:
             shap_values = self.explainer.shap_values(feature_vector.reshape(1, -1), nsamples=nsamples)
             
@@ -493,8 +510,6 @@ class SHAPAnalyzer:
         
         for book_id, score in recommendations[:5]:
             explanation = self.explain_prediction(user_id, book_id, nsamples, save_plot=False)
-
-            self.diagnose_feature_mapping(user_id, book_id)
             
             if 'error' not in explanation:
                 results.append({
@@ -622,9 +637,8 @@ class SHAPAnalyzer:
         # 5. Проверяем, какие фичи реально передаются в модель при forward_single
         print(f"\n5. ПРОВЕРКА forward_single:")
         try:
-            # Получаем индексы
-            user_idx = self.trainer.user_encoder.transform([user_id])[0] if hasattr(self.trainer, 'user_encoder') else 0
-            book_idx = self.trainer.book_encoder.transform([book_id])[0] if hasattr(self.trainer, 'book_encoder') else 0
+            user_idx = self.trainer._user_to_idx.get(user_id, 0) if hasattr(self.trainer, '_user_to_idx') else 0
+            book_idx = self.trainer._book_to_idx.get(str(book_id), 0) if hasattr(self.trainer, '_book_to_idx') else 0
             
             # Строим тензоры
             user_num = torch.tensor(vec[:len(self.user_num_features)], dtype=torch.float32).unsqueeze(0) if len(self.user_num_features) > 0 else None
