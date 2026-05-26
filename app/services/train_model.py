@@ -153,7 +153,7 @@ class CollaborativeGenerator:
             train_ratings=train_ratings,
             popular_books=popular_books,
             books_df=books_df,
-            add_ratio=0.05
+            add_ratio=0.20
         )
         
         # 3. Анализ качества (если есть тестовые данные)
@@ -425,26 +425,45 @@ class AFMTrainer:
         except (ValueError, TypeError):
             return default
 
-    def prepare_dataloaders(self, triplets_df: pd.DataFrame, 
-                        user_features: pd.DataFrame, 
-                        book_features: pd.DataFrame) -> Tuple[DataLoader, DataLoader, AFMDataset]:
+    def prepare_dataloaders(self, triplets_df: pd.DataFrame,
+                        user_features: pd.DataFrame,
+                        book_features: pd.DataFrame,
+                        fit_encoders: bool = True) -> Tuple[DataLoader, DataLoader, AFMDataset]:
         """
-        Подготовка dataloaders для обучения
+        Подготовка dataloaders для обучения.
+
+        fit_encoders=False используется при дообучении: энкодеры, скейлеры и
+        список колонок берутся из уже обученного тренера, а не обучаются заново.
         """
         print("\n📊 Подготовка датасета...")
-        
+
         print(f"\n🔍 ВХОДНЫЕ ДАННЫЕ ДЛЯ DATASET:")
         print(f"   user_features shape: {user_features.shape}")
         print(f"   book_features shape: {book_features.shape}")
         print(f"   triplets count: {len(triplets_df)}")
+        print(f"   fit_encoders: {fit_encoders}")
 
-        # Создаем датасет с fit_encoders=True
-        dataset = AFMDataset(
-            triplets_df=triplets_df,
-            user_features=user_features,
-            book_features=book_features,
-            fit_encoders=True  # Важно!
-        )
+        if fit_encoders:
+            dataset = AFMDataset(
+                triplets_df=triplets_df,
+                user_features=user_features,
+                book_features=book_features,
+                fit_encoders=True,
+            )
+        else:
+            # Повторно использовать зафиксированные энкодеры/скейлеры/колонки
+            dataset = AFMDataset(
+                triplets_df=triplets_df,
+                user_features=user_features,
+                book_features=book_features,
+                fit_encoders=False,
+                user_encoder=self.user_encoder,
+                book_encoder=self.book_encoder,
+                user_scaler=self.user_scaler,
+                book_scaler=self.book_scaler,
+                user_num_cols=self.user_num_cols,
+                book_num_cols=self.book_num_cols,
+            )
         
         print(f"\n✅ ДАТАСЕТ СОЗДАН:")
         print(f"   User числовых колонок: {len(dataset.user_num_cols)}")
@@ -482,14 +501,15 @@ class AFMTrainer:
         print(f"   User numerical features: {len(dataset.user_num_cols)}")
         print(f"   Book numerical features: {len(dataset.book_num_cols)}")
         
-        # Сохраняем encoder'ы и scaler'ы из dataset
-        self.user_encoder = dataset.user_encoder
-        self.book_encoder = dataset.book_encoder
-        self.user_scaler = dataset.user_scaler
-        self.book_scaler = dataset.book_scaler
-        self.user_num_cols = dataset.user_num_cols
-        self.book_num_cols = dataset.book_num_cols
-        
+        if fit_encoders:
+            # Сохраняем encoder'ы и scaler'ы из dataset только при первичном обучении
+            self.user_encoder = dataset.user_encoder
+            self.book_encoder = dataset.book_encoder
+            self.user_scaler = dataset.user_scaler
+            self.book_scaler = dataset.book_scaler
+            self.user_num_cols = dataset.user_num_cols
+            self.book_num_cols = dataset.book_num_cols
+
         return train_loader, val_loader, dataset
 
     def create_model(self, dataset: AFMDataset) -> AFMRanker:
@@ -625,9 +645,9 @@ class AFMTrainer:
             self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
             print("   Оптимизатор сброшен")
         
-        # Подготовка данных (может быть только часть данных для дообучения)
+        # Подготовка данных с зафиксированными энкодерами/скейлерами
         train_loader, val_loader, _ = self.prepare_dataloaders(
-            triplets_df, user_features, book_features
+            triplets_df, user_features, book_features, fit_encoders=False
         )
         
         # Создаем scheduler

@@ -128,14 +128,14 @@ class CollaborativeFilter:
         for i, user in enumerate(tqdm(user_item_matrix.index, desc="CF рекомендации")):
             top_items = item_ids[top_n_indices[i]]
             top_scores = predictions[i, top_n_indices[i]]
-            valid = (top_scores > -np.inf) & (top_scores >= 0)
+            valid = top_scores > -np.inf
             if valid.any():
                 recommendations[user] = dict(zip(top_items[valid], top_scores[valid]))
         
         # 4. Добавляем кандидатов от авторов из истории пользователя
         print("\n📚 Добавление кандидатов от популярных авторов из истории...")
         recommendations = self._add_author_based_candidates(
-            recommendations, train_ratings, books_df, n_recommendations
+            recommendations, train_ratings, books_df
         )
         
         self.recommendations = recommendations
@@ -143,11 +143,10 @@ class CollaborativeFilter:
         
         return recommendations
     
-    def _add_author_based_candidates(self, 
+    def _add_author_based_candidates(self,
                                      recommendations: Dict[int, Dict[str, float]],
                                      train_ratings: pd.DataFrame,
-                                     books_df: pd.DataFrame,
-                                     target_total: int = 1000) -> Dict[int, Dict[str, float]]:
+                                     books_df: pd.DataFrame) -> Dict[int, Dict[str, float]]:
         """
         Добавляет кандидатов от авторов из истории пользователя:
         - Для каждого пользователя находим всех авторов, которых он читал
@@ -175,7 +174,7 @@ class CollaborativeFilter:
         
         # Для каждого пользователя собираем авторов из истории
         user_authors = train_with_authors.groupby('User-ID')['Author_norm'].apply(
-            lambda x: set(x.dropna())
+            lambda vals: set(vals.dropna())
         ).to_dict()
         
         print(f"   Уникальных авторов в истории: {len(set([a for users in user_authors.values() for a in users]))}")
@@ -201,8 +200,7 @@ class CollaborativeFilter:
                 # Добавляем по 2 книги от каждого автора
                 for book in new_books[:2]:
                     if book not in user_recs:
-                        # Вес 0.2 - чуть выше, чем у случайных популярных книг
-                        new_candidates[book] = 0.2
+                        new_candidates[book] = 0
             
             if new_candidates:
                 user_recs.update(new_candidates)
@@ -210,13 +208,7 @@ class CollaborativeFilter:
                 users_with_new_candidates += 1
         
         print(f"   Добавлено {added_count} кандидатов от авторов для {users_with_new_candidates} пользователей")
-        
-        # Обрезаем до target_total, оставляя топ по score
-        for user_id in recommendations:
-            if len(recommendations[user_id]) > target_total:
-                sorted_items = sorted(recommendations[user_id].items(), key=lambda x: x[1], reverse=True)
-                recommendations[user_id] = dict(sorted_items[:target_total])
-        
+
         return recommendations
     
     def save_candidates(self, filepath: str = "models/collaborative_candidates.pkl"):
@@ -346,7 +338,7 @@ class PopularityFallback:
                 chosen_books.extend(random.sample(available_author_books, min(n_author, len(available_author_books))))
             
             for book in chosen_books:
-                current_recs[book] = 0.1
+                current_recs[book] = 0
             
             total_added += len(chosen_books)
         

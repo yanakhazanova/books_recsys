@@ -34,6 +34,21 @@ app.add_middleware(
 
 app.include_router(router)
 
+# Отключаем браузерное кэширование статики, чтобы изменения в app.js
+# применялись немедленно без ручного hard-refresh.
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+app.add_middleware(NoCacheStaticMiddleware)
+
 # Serve frontend
 STATIC_DIR = Path(__file__).parent / "static"
 if STATIC_DIR.is_dir():

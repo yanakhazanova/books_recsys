@@ -135,10 +135,11 @@ class AFMRanker(nn.Module):
 class AFMDataset(Dataset):
     """Dataset для AFM с поддержкой fit_encoders параметра"""
     
-    def __init__(self, triplets_df, user_features, book_features, 
+    def __init__(self, triplets_df, user_features, book_features,
                  user_encoder=None, book_encoder=None,
                  user_scaler=None, book_scaler=None,
-                 fit_encoders=True):
+                 fit_encoders=True,
+                 user_num_cols=None, book_num_cols=None):
         
         self.triplets = triplets_df
         self.user_features = user_features
@@ -226,8 +227,18 @@ class AFMDataset(Dataset):
             self.book_encoder = book_encoder
             self.user_scaler = user_scaler
             self.book_scaler = book_scaler
-            self.user_num_cols = user_features.select_dtypes(include=[np.number]).columns.tolist()
-            self.book_num_cols = book_features.select_dtypes(include=[np.number]).columns.tolist()
+            # Use the exact same columns as the original training run if provided,
+            # otherwise derive them (filtering out ID columns the same way).
+            if user_num_cols is not None:
+                self.user_num_cols = user_num_cols
+            else:
+                cols = user_features.select_dtypes(include=[np.number]).columns.tolist()
+                self.user_num_cols = [c for c in cols if c not in ('User-ID', 'user_id', 'ISBN')]
+            if book_num_cols is not None:
+                self.book_num_cols = book_num_cols
+            else:
+                cols = book_features.select_dtypes(include=[np.number]).columns.tolist()
+                self.book_num_cols = [c for c in cols if c not in ('ISBN', 'index')]
         
         print(f"   User numerical features ({len(self.user_num_cols)}): {self.user_num_cols}...")
         print(f"   Book numerical features ({len(self.book_num_cols)}): {self.book_num_cols}...")

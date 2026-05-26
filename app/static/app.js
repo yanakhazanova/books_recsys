@@ -95,7 +95,6 @@ async function refreshStatus() {
   }
 }
 refreshStatus();
-setInterval(refreshStatus, 120000);
 
 /* ============================================================
    1) /train_full
