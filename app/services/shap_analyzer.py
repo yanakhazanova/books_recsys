@@ -85,10 +85,15 @@ class SHAPAnalyzer:
         if not hasattr(self.trainer, 'book_features') or self.trainer.book_features is None:
             return pairs
         
-        users = list(self.trainer.user_features.index)[:n_users]
-        
-        for user_id in users:
-            books = list(self.trainer.book_features.index)[:n_books_per_user]
+        all_users = list(self.trainer.user_features.index)
+        all_books = list(self.trainer.book_features.index)
+        import random
+        random.seed(42)
+        users = random.sample(all_users, min(n_users, len(all_users)))
+        sampled_books = random.sample(all_books, min(n_books_per_user * n_users, len(all_books)))
+
+        for i, user_id in enumerate(users):
+            books = sampled_books[i * n_books_per_user:(i + 1) * n_books_per_user]
             for book_id in books:
                 pairs.append((user_id, str(book_id)))
         
@@ -347,7 +352,16 @@ class SHAPAnalyzer:
         logger.info(f"Вычисление SHAP для {len(test_vectors)} тестовых пар...")
         
         all_shap_values = []
-        for i in tqdm(range(len(X_test)), desc="SHAP computation"):
+        for i, (user_id, book_id) in enumerate(tqdm(
+                zip([p[0] for p in test_pairs[:len(test_vectors)]],
+                    [p[1] for p in test_pairs[:len(test_vectors)]]),
+                total=len(test_vectors), desc="SHAP computation")):
+            # Устанавливаем правильные ID-эмбеддинги для каждой пары,
+            # иначе _predict_fn всегда использует ID=0 → нестабильный WLS.
+            self._ctx_user_idx = self.trainer._user_to_idx.get(user_id, 0) \
+                if hasattr(self.trainer, '_user_to_idx') else 0
+            self._ctx_book_idx = self.trainer._book_to_idx.get(str(book_id), 0) \
+                if hasattr(self.trainer, '_book_to_idx') else 0
             try:
                 shap_vals = self.explainer.shap_values(X_test[i:i+1], nsamples=nsamples_per_pair)
                 
